@@ -169,31 +169,47 @@ func Setup(o SetupOptions) error {
 	}
 	o.Out("Worker URL: %s\n", workerURL)
 
-	// A fresh workers.dev hostname can take a little while to resolve.
+	// A fresh workers.dev hostname can take a little while to resolve, and
+	// after a redeploy the previous version can keep answering for a short
+	// while, so wait until the worker reports the key that was just uploaded.
 	var info struct {
 		WorkerKey string `json:"worker_key"`
 	}
+	want := proto.EncodeKey(signing.Public().(ed25519.PublicKey))
 	unsigned := &proto.Client{BaseURL: workerURL}
 	for i := 0; ; i++ {
-		if err = unsigned.Do("GET", "/v1/info", nil, &info); err == nil {
+		err = unsigned.Do("GET", "/v1/info", nil, &info)
+		if err == nil && info.WorkerKey == want {
 			break
 		}
-		if i == 30 {
-			return fmt.Errorf("worker not reachable: %w", err)
+		if i == 60 {
+			if err != nil {
+				return fmt.Errorf("worker not reachable: %w", err)
+			}
+			return errors.New("the deployed worker still reports an unexpected key")
 		}
 		time.Sleep(5 * time.Second)
 	}
-	if info.WorkerKey != proto.EncodeKey(signing.Public().(ed25519.PublicKey)) {
-		return errors.New("the deployed worker reports an unexpected key")
-	}
 
-	if err := telegram(o.BotToken, "setWebhook", map[string]any{
-		"url":                  workerURL + "/telegram/webhook",
-		"secret_token":         webhookSecret,
-		"allowed_updates":      []string{"callback_query"},
-		"drop_pending_updates": true,
-	}); err != nil {
-		return fmt.Errorf("setting the Telegram webhook: %w", err)
+	// Telegram resolves the new hostname itself, which can take a few
+	// minutes longer than it takes to resolve here.
+	for i := 0; ; i++ {
+		err = telegram(o.BotToken, "setWebhook", map[string]any{
+			"url":                  workerURL + "/telegram/webhook",
+			"secret_token":         webhookSecret,
+			"allowed_updates":      []string{"callback_query"},
+			"drop_pending_updates": true,
+		})
+		if err == nil {
+			break
+		}
+		if i == 40 {
+			return fmt.Errorf("setting the Telegram webhook: %w", err)
+		}
+		if i == 0 {
+			o.Out("Waiting until Telegram can resolve the worker URL (can take a few minutes)...\n")
+		}
+		time.Sleep(15 * time.Second)
 	}
 
 	cfg := &Config{
