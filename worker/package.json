@@ -1,0 +1,7 @@
+{
+  "name": "request-access-worker",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test test/*.test.js" },
+  "devDependencies": { "miniflare": "^4.0.0" }
+}
