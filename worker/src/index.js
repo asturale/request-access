@@ -8,7 +8,7 @@
 // All state lives in a single Durable Object (strongly consistent, unlike KV,
 // whose cross-location reads can lag by up to a minute).
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const MAX_SKEW = 60; // seconds between a signed request's timestamp and now
 const NONCE_TTL = 600; // seconds a request nonce is remembered (replay protection)
 const MAX_PENDING_ENROLLMENTS = 3;
