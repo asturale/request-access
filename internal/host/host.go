@@ -38,7 +38,8 @@ type Config struct {
 	Name      string `json:"name"`
 	ServerKey string `json:"server_key"`
 	// Users that never need approval (for example a restricted service
-	// account used by automation).
+	// account used by automation): "user" for every service, or
+	// "service:user" (e.g. "sudo:root") for one service only.
 	ExemptUsers []string `json:"exempt_users,omitempty"`
 	// Maps PAM service names to the service shown and windowed on the
 	// server. Unlisted PAM services fall back to their own name.
@@ -84,6 +85,16 @@ func SaveConfig(c *Config) error {
 
 func (c *Config) Client(key ed25519.PrivateKey) *proto.Client {
 	return &proto.Client{BaseURL: c.URL, KeyID: "host:" + c.Name, Key: key}
+}
+
+// Exempt reports whether user needs no approval for service. sudo started
+// by root is always exempt: root already has every right sudo could grant,
+// and gating it would only stall root cron jobs. Root SSH logins are not.
+func (c *Config) Exempt(service, user string) bool {
+	if service == "sudo" && user == "root" {
+		return true
+	}
+	return slices.Contains(c.ExemptUsers, user) || slices.Contains(c.ExemptUsers, service+":"+user)
 }
 
 func (c *Config) ServiceFor(pamService string) string {
@@ -221,10 +232,10 @@ func Check(r Request, out func(string)) Decision {
 	if err != nil {
 		return Decision{Reason: "not configured: " + err.Error()}
 	}
-	if slices.Contains(cfg.ExemptUsers, r.User) {
+	service := cfg.ServiceFor(r.PAMService)
+	if cfg.Exempt(service, r.User) {
 		return Decision{Allowed: true, Reason: "exempt user"}
 	}
-	service := cfg.ServiceFor(r.PAMService)
 	now := time.Now()
 	if g := loadGrant(srv, service, r.User); g != nil && g.Allows(cfg.Name, service, r.User, now) {
 		return Decision{Allowed: true, Reason: "cached grant", Cached: true}

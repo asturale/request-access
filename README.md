@@ -124,7 +124,11 @@ only to the grant cache, which gets its own file type.
 
 ### Exempting automation
 
-Users listed with `--exempt` never need approval. Use this for a dedicated
+`sudo` started by root (a root shell or a root cron job) never needs
+approval: root already has every right `sudo` could grant. Root SSH logins
+do. Users listed with `--exempt` never need approval either; use
+`--exempt ssh:deploy` to limit that to one service. Passing `--exempt`
+replaces the current list. Use this for a dedicated
 account whose SSH key is already restricted to one command
 (`restrict,command="..."` in `authorized_keys`), not for anything with a
 shell.

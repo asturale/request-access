@@ -34,7 +34,7 @@ Admin (on your own machine):
 
 Server (as root):
   enroll    --url URL --name NAME [--server-key KEY]   register this server (confirmed on Telegram)
-  install   [--ssh] [--sudo] [--exempt USER ...]       add the PAM rules
+  install   [--ssh] [--sudo] [--exempt [SERVICE:]USER ...]  add the PAM rules
   uninstall                              remove the PAM rules
   status                                 show configuration and cached grants
   revoke    [--service S] [--user U]     forget cached grants
@@ -232,7 +232,7 @@ func cmdInstall(args []string) error {
 	ssh := fs.Bool("ssh", false, "require approval for SSH logins")
 	sudo := fs.Bool("sudo", false, "require approval for sudo")
 	var exempt multi
-	fs.Var(&exempt, "exempt", "user that never needs approval (repeatable)")
+	fs.Var(&exempt, "exempt", "user that never needs approval: USER, or SERVICE:USER for one service (repeatable; replaces the current list)")
 	fs.Parse(args)
 	if !*ssh && !*sudo {
 		return fmt.Errorf("pass --ssh and/or --sudo")
@@ -244,9 +244,12 @@ func cmdInstall(args []string) error {
 	if err != nil {
 		return fmt.Errorf("enroll first: %w", err)
 	}
-	for _, u := range exempt {
-		if !contains(cfg.ExemptUsers, u) {
-			cfg.ExemptUsers = append(cfg.ExemptUsers, u)
+	if len(exempt) > 0 {
+		cfg.ExemptUsers = nil
+		for _, u := range exempt {
+			if !contains(cfg.ExemptUsers, u) {
+				cfg.ExemptUsers = append(cfg.ExemptUsers, u)
+			}
 		}
 	}
 	if err := host.SaveConfig(cfg); err != nil {

@@ -180,6 +180,22 @@ test('admin: denied change is not applied', async () => {
   assert.match(s.stdout, /"ssh": 1200/);
 });
 
+test('exempt users: global and per service', async () => {
+  const f = path.join(env.REQUEST_ACCESS_CONFIG_DIR, 'config.json');
+  const cfg = JSON.parse(fs.readFileSync(f));
+  cfg.exempt_users = ['backup', 'ssh:deploy'];
+  fs.writeFileSync(f, JSON.stringify(cfg));
+  nextTap = 'd';
+  const before = messages.length;
+  assert.equal((await pam('sshd', 'backup')).code, 0);
+  assert.equal((await pam('sshd', 'deploy')).code, 0);
+  assert.equal((await pam('sudo', 'root', { PAM_RUSER: 'root' })).code, 0, 'sudo by root is always exempt');
+  assert.equal(messages.length, before, 'exempt users send no request');
+  assert.notEqual((await pam('sudo', 'root', { PAM_RUSER: 'deploy' })).code, 0, 'ssh:deploy does not cover sudo');
+  assert.notEqual((await pam('sshd', 'root')).code, 0, 'root ssh logins still need approval');
+  assert.equal(messages.length, before + 2);
+});
+
 test('unconfigured host fails closed', async () => {
   const r = await run(['pam'], { PAM_TYPE: 'account', PAM_SERVICE: 'sshd', PAM_USER: 'x', REQUEST_ACCESS_CONFIG_DIR: path.join(tmp, 'nope') });
   assert.notEqual(r.code, 0);
