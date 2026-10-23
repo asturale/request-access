@@ -252,7 +252,8 @@ export class State {
     const existing = await this.storage.get('host:' + name);
     const fp = await fingerprint(r.key);
     const text = [
-      `🖥️ <b>${esc(existing ? t.reenroll : t.enroll)}</b>: <b>${esc(name)}</b>`,
+      `🖥️ <b>${esc(existing ? t.reenroll : t.enroll)}</b>`,
+      `${esc(t.server)}: <b>${esc(name)}</b>`,
       `${esc(t.fingerprint)}: <code>${esc(fp)}</code>`,
       esc(t.compare),
     ].join('\n');
@@ -607,7 +608,7 @@ function fmtDuration(s, lang) {
 function texts(lang) {
   const en = {
     title: { ssh: 'SSH login', sudo: 'sudo' },
-    on: 'on', user: 'User', from: 'From',
+    on: 'on', user: 'User', from: 'From', server: 'Server',
     allow: 'Allow', once: 'Just this once', deny: 'Deny',
     approved_by: 'Approved by', denied_by: 'Denied by', valid_for: 'valid for', once_note: 'this once',
     expired: 'Expired, no answer in time', not_allowed: 'You are not an approver.',
@@ -619,7 +620,7 @@ function texts(lang) {
   if (lang !== 'nl') return en;
   return {
     title: { ssh: 'SSH-login', sudo: 'sudo' },
-    on: 'op', user: 'Gebruiker', from: 'Vanaf',
+    on: 'op', user: 'Gebruiker', from: 'Vanaf', server: 'Server',
     allow: 'Toestaan', once: 'Alleen deze keer', deny: 'Weigeren',
     approved_by: 'Goedgekeurd door', denied_by: 'Geweigerd door', valid_for: 'geldig', once_note: 'alleen deze keer',
     expired: 'Verlopen, niet op tijd beantwoord', not_allowed: 'Je mag dit niet goedkeuren.',
