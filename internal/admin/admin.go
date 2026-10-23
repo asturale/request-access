@@ -83,6 +83,7 @@ type SetupOptions struct {
 	ApproverID string // Telegram user id; also the chat the bot writes to
 	Lang       string
 	Update     bool // redeploy the script only, keep keys and secrets
+	Replace    bool // set up again over an existing worker (new keys; hosts must re-enroll)
 	Out        func(format string, a ...any)
 }
 
@@ -122,8 +123,8 @@ func Setup(o SetupOptions) error {
 	if err != nil {
 		return err
 	}
-	if exists {
-		return fmt.Errorf("a worker named %q already exists; use --update to redeploy it, or pick another --name", o.WorkerName)
+	if exists && !o.Replace {
+		return fmt.Errorf("a worker named %q already exists; use --update to redeploy it, --replace to set it up again with new keys, or pick another --name", o.WorkerName)
 	}
 
 	// The bot must be able to write to the approver first.
@@ -149,7 +150,7 @@ func Setup(o SetupOptions) error {
 	err = cf.Deploy(cloudflare.DeployOptions{
 		Name:   o.WorkerName,
 		Script: worker.Script,
-		Create: true,
+		Create: !exists,
 		Secrets: map[string]string{
 			"SIGNING_KEY":             base64.RawURLEncoding.EncodeToString(pkcs8),
 			"TELEGRAM_BOT_TOKEN":      o.BotToken,

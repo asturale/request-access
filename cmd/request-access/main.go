@@ -24,6 +24,7 @@ const usage = `request-access -- approve SSH logins and sudo with a tap on Teleg
 Admin (on your own machine):
   setup     --cf-token T --bot-token B --approver ID [--name request-access] [--lang en|nl] [--account-id A]
   setup     --update --cf-token T        redeploy the worker script (after an upgrade)
+  setup     --replace ...                set up again over an existing worker (new keys)
   config                                 show server settings
   config    key=value ...                change settings (confirmed on Telegram), e.g.
                                          window.ssh=15m window.sudo=30m window.web1/sudo=5m
@@ -143,6 +144,7 @@ func cmdSetup(args []string) error {
 	approver := fs.String("approver", os.Getenv("TELEGRAM_APPROVER_ID"), "your numeric Telegram user id")
 	lang := fs.String("lang", "en", "message language: en or nl")
 	update := fs.Bool("update", false, "redeploy the worker script only")
+	replace := fs.Bool("replace", false, "set up again over an existing worker (new keys; servers must re-enroll)")
 	fs.Parse(args)
 	if *token == "" {
 		return fmt.Errorf("--cf-token (or CLOUDFLARE_API_TOKEN) is required")
@@ -153,7 +155,7 @@ func cmdSetup(args []string) error {
 	}
 	return admin.Setup(admin.SetupOptions{
 		CFToken: *token, AccountID: *account, WorkerName: n, BotToken: *bot,
-		ApproverID: *approver, Lang: *lang, Update: *update, Out: printf,
+		ApproverID: *approver, Lang: *lang, Update: *update, Replace: *replace, Out: printf,
 	})
 }
 
