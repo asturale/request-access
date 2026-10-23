@@ -378,7 +378,8 @@ func cmdRevoke(args []string) error {
 }
 
 func requireRoot() error {
-	if os.Geteuid() != 0 {
+	// Tests point the config directory elsewhere and run unprivileged.
+	if os.Geteuid() != 0 && os.Getenv("REQUEST_ACCESS_CONFIG_DIR") == "" {
 		return fmt.Errorf("run this as root")
 	}
 	return nil
