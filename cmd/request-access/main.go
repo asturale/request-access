@@ -270,6 +270,11 @@ func cmdInstall(args []string) error {
 			svcs = append(svcs, "sudo-i")
 		}
 	}
+	// Created here, as root, so the PAM check never has to create it (on
+	// SELinux systems sshd may not create directories under /var/lib).
+	if err := os.MkdirAll(filepath.Join(host.StateDir, "grants"), 0o700); err != nil {
+		return err
+	}
 	if err := host.InstallPAM(svcs, bin); err != nil {
 		return err
 	}

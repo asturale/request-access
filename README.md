@@ -115,18 +115,12 @@ files are kept as `*.request-access.bak`.
 
 ### SELinux
 
-On SELinux systems (Fedora, RHEL and derivatives) the SSH daemon may not
-open outgoing connections, so an SSH check fails closed with
-`connect: permission denied`. Allow `sshd` to reach web ports with a small
-local module, generated from the denial after a first (failed) login:
-
-```sh
-ausearch -m avc -ts recent -c request-access | audit2allow -M request-access
-semodule -i request-access.pp
-```
-
-The resulting rule is `allow sshd_t http_port_t:tcp_socket name_connect;`,
-which is narrower than the `nis_enabled` boolean.
+On SELinux systems (Fedora, RHEL and derivatives) the SSH daemon may neither
+open outgoing connections nor write under `/var/lib`, so an SSH check fails
+closed (`connect: permission denied`) or every login asks again. Load the
+module in [`selinux/request-access.te`](selinux/request-access.te); its
+header has the four commands. It lets `sshd` connect to web ports and write
+only to the grant cache, which gets its own file type.
 
 ### Exempting automation
 

@@ -1,0 +1,33 @@
+# SELinux policy for Request Access on SELinux systems (Fedora, RHEL, ...).
+#
+# The PAM check runs inside sshd's domain (sshd_t), which may neither open
+# outgoing connections nor write under /var/lib. This module lets sshd_t
+# connect to web ports and manage files in a dedicated type that is only
+# used for the grant cache in /var/lib/request-access.
+#
+# Build and load (needs checkmodule/semodule_package, from
+# policycoreutils/checkpolicy):
+#   checkmodule -M -m -o request-access.mod request-access.te
+#   semodule_package -o request-access.pp -m request-access.mod
+#   semodule -i request-access.pp
+#   semanage fcontext -a -t request_access_var_t '/var/lib/request-access(/.*)?'
+#   restorecon -R /var/lib/request-access
+module request-access 1.1;
+
+require {
+	type sshd_t;
+	type http_port_t;
+	type var_lib_t;
+	attribute file_type;
+	class tcp_socket name_connect;
+	class dir { getattr search open read write add_name remove_name create setattr };
+	class file { getattr open read write create rename unlink setattr };
+}
+
+type request_access_var_t;
+typeattribute request_access_var_t file_type;
+
+allow sshd_t http_port_t:tcp_socket name_connect;
+allow sshd_t var_lib_t:dir search;
+allow sshd_t request_access_var_t:dir { getattr search open read write add_name remove_name create setattr };
+allow sshd_t request_access_var_t:file { getattr open read write create rename unlink setattr };
