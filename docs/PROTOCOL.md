@@ -71,3 +71,9 @@ it for the same service and user until `exp`.
 
 Window lookup: `<host>/<service>`, then `<service>`, then `default_window`;
 always capped at `max_window`.
+
+`routes` (optional) maps `<host>`, `user:<user>` or `<host>/user:<user>` to
+`{"chat": "<chat id>", "approvers": ["<user id>", …], "required": N}`.
+An access request uses the most specific match, else the default approver;
+only that route's approvers can decide it, and it is approved once
+`required` distinct approvers tapped Allow (any Deny denies).

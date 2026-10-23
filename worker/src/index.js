@@ -19,6 +19,11 @@ const DEFAULT_CONFIG = {
   windows: { ssh: 900, sudo: 900 }, // seconds a grant stays valid, per service or "host/service"
   default_window: 900,
   max_window: 86400,
+  // Who approves what. Keys: "<host>", "user:<user>" or "<host>/user:<user>"
+  // (most specific wins). Values: { chat, approvers: [telegram user ids],
+  // required }. Anything without a route goes to the default approver set
+  // at setup (TELEGRAM_CHAT_ID / APPROVER_IDS), one tap needed.
+  routes: {},
 };
 
 export default {
@@ -135,6 +140,8 @@ export class State {
       expires: now() + cfg.request_timeout,
       window: windowFor(cfg, caller.name, service),
       status: 'pending',
+      ...routeFor(cfg, this.env, caller.name, user),
+      approvals: [],
     };
     const t = texts(cfg.lang);
     const lines = [
@@ -144,8 +151,9 @@ export class State {
     if (req.rhost) lines.push(`${esc(t.from)}: <code>${esc(req.rhost)}</code>`);
     if (req.tty) lines.push(`TTY: <code>${esc(req.tty)}</code>`);
     if (req.detail) lines.push(`<code>${esc(req.detail)}</code>`);
+    if (req.required > 1) lines.push(`👥 ${esc(t.needs)} ${req.required}`);
     const sent = await this.telegram('sendMessage', {
-      chat_id: this.env.TELEGRAM_CHAT_ID,
+      chat_id: req.chat,
       text: lines.join('\n'),
       parse_mode: 'HTML',
       reply_markup: {
@@ -160,6 +168,13 @@ export class State {
     });
     req.message_id = sent && sent.message_id;
     req.text = lines.join('\n');
+    req.keyboard = [
+      [
+        { text: `✅ ${t.allow} ${fmtDuration(req.window, cfg.lang)}`, callback_data: `r:${id}:a` },
+        { text: `☑️ ${t.once}`, callback_data: `r:${id}:o` },
+      ],
+      [{ text: `❌ ${t.deny}`, callback_data: `r:${id}:d` }],
+    ];
     await this.storage.put('req:' + id, req);
     await this.scheduleAlarm(req.expires);
     return json({ id, expires: req.expires, window: req.window });
@@ -193,7 +208,17 @@ export class State {
       req.status = 'denied';
       await this.editDecision(req, `❌ ${t.denied_by} ${who(from)}`);
     } else {
-      const window = choice === 'o' ? 30 : req.window;
+      // With several approvers required, collect distinct approvals first.
+      // "Just this once" from any of them makes the grant a one-off.
+      const id = String(from && from.id);
+      if (!req.approvals.some((a) => a.id === id)) req.approvals.push({ id, who: who(from), once: choice === 'o' });
+      if (req.approvals.length < (req.required || 1)) {
+        await this.editDecision(req, `⏳ ${req.approvals.length}/${req.required}: ${req.approvals.map((a) => a.who).join(', ')}`, true);
+        await this.storage.put('req:' + req.id, req);
+        return 'pending';
+      }
+      const once = req.approvals.some((a) => a.once);
+      const window = once ? 30 : req.window;
       const payload = {
         v: 1,
         kind: 'grant',
@@ -202,14 +227,14 @@ export class State {
         service: req.service,
         user: req.user,
         nonce: req.nonce,
-        once: choice === 'o',
+        once,
         iat: now(),
         exp: now() + window,
       };
       req.grant = await this.sign(payload);
       req.status = 'approved';
-      const label = choice === 'o' ? t.once_note : `${t.valid_for} ${fmtDuration(window, cfg.lang)}`;
-      await this.editDecision(req, `✅ ${t.approved_by} ${who(from)} (${label})`);
+      const label = once ? t.once_note : `${t.valid_for} ${fmtDuration(window, cfg.lang)}`;
+      await this.editDecision(req, `✅ ${t.approved_by} ${req.approvals.map((a) => a.who).join(', ')} (${label})`);
     }
     req.decided = now();
     await this.storage.put('req:' + req.id, req);
@@ -223,14 +248,17 @@ export class State {
     await this.editDecision(req, `⌛ ${t.expired}`);
   }
 
-  async editDecision(req, line) {
+  // keepButtons: an intermediate state (some approvals still missing).
+  async editDecision(req, line, keepButtons = false) {
     if (!req.message_id) return;
-    await this.telegram('editMessageText', {
-      chat_id: this.env.TELEGRAM_CHAT_ID,
+    const params = {
+      chat_id: req.chat || this.env.TELEGRAM_CHAT_ID,
       message_id: req.message_id,
       text: `${req.text}\n\n${esc(line)}`,
       parse_mode: 'HTML',
-    });
+    };
+    if (keepButtons && req.keyboard) params.reply_markup = { inline_keyboard: req.keyboard };
+    await this.telegram('editMessageText', params);
   }
 
   // ---------------------------------------------------------------- enrollment
@@ -391,19 +419,25 @@ export class State {
     const update = await request.json();
     const cq = update.callback_query;
     if (!cq) return json({ ok: true });
-    const approvers = String(this.env.APPROVER_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
     const t = texts((await this.config()).lang);
-    if (!approvers.includes(String(cq.from && cq.from.id))) {
+    const fromId = String(cq.from && cq.from.id);
+    const denyTap = async () => {
       await this.telegram('answerCallbackQuery', { callback_query_id: cq.id, text: t.not_allowed });
       return json({ ok: true });
-    }
+    };
     const m = /^([rex]):([0-9a-f]{32}):([aod])$/.exec(cq.data || '');
     let result = 'unknown';
     if (m) {
       const [, kind, id, choice] = m;
+      // Access requests are approved by their route's approvers; enrolling
+      // hosts and admin changes only by the default approvers.
       if (kind === 'r') {
         const req = await this.storage.get('req:' + id);
-        if (req) result = await this.decideAccess(req, choice, cq.from);
+        const allowed = req ? req.approvers || defaultApprovers(this.env) : [];
+        if (!allowed.includes(fromId)) return denyTap();
+        result = await this.decideAccess(req, choice, cq.from);
+      } else if (!defaultApprovers(this.env).includes(fromId)) {
+        return denyTap();
       } else if (kind === 'e') {
         const enr = await this.storage.get('enr:' + id);
         if (enr) result = await this.decideEnroll(enr, choice === 'o' ? 'a' : choice, cq.from);
@@ -582,13 +616,38 @@ function validateConfig(c) {
     windows[k] = num(v, 30, out.max_window, `window ${k}`);
   }
   out.windows = windows;
+  const routes = {};
+  for (const [k, v] of Object.entries(out.routes || {})) {
+    if (!/^([A-Za-z0-9._-]+|user:[A-Za-z0-9._@-]+|[A-Za-z0-9._-]+\/user:[A-Za-z0-9._@-]+)$/.test(k)) throw new HttpError(400, `bad route key ${k}`);
+    if (v === null) continue;
+    const approvers = (Array.isArray(v.approvers) ? v.approvers : String(v.approvers || '').split(','))
+      .map((x) => String(x).trim()).filter(Boolean);
+    if (!approvers.length || !approvers.every((x) => /^\d+$/.test(x))) throw new HttpError(400, `route ${k}: approvers must be numeric Telegram user ids`);
+    const chat = String(v.chat || (approvers.length === 1 ? approvers[0] : ''));
+    if (!/^-?\d+$/.test(chat)) throw new HttpError(400, `route ${k}: chat must be a numeric Telegram chat id`);
+    const required = num(v.required ?? 1, 1, approvers.length, `route ${k}: required`);
+    routes[k] = { chat, approvers, required };
+  }
+  out.routes = routes;
   return out;
+}
+
+function defaultApprovers(env) {
+  return String(env.APPROVER_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+function routeFor(cfg, env, host, user) {
+  const r = cfg.routes || {};
+  const hit = r[`${host}/user:${user}`] || r[`user:${user}`] || r[host];
+  if (hit) return { chat: hit.chat, approvers: hit.approvers, required: hit.required };
+  return { chat: String(env.TELEGRAM_CHAT_ID), approvers: defaultApprovers(env), required: 1 };
 }
 
 function diffConfig(a, b) {
   const flat = (c) => {
     const o = { lang: c.lang, request_timeout: c.request_timeout, default_window: c.default_window, max_window: c.max_window };
     for (const [k, v] of Object.entries(c.windows || {})) o[`windows.${k}`] = v;
+    for (const [k, v] of Object.entries(c.routes || {})) o[`routes.${k}`] = `chat ${v.chat}, approvers ${v.approvers.join('+')}, required ${v.required}`;
     return o;
   };
   const fa = flat(a), fb = flat(b);
@@ -608,26 +667,26 @@ function fmtDuration(s, lang) {
 function texts(lang) {
   const en = {
     title: { ssh: 'SSH login', sudo: 'sudo' },
-    on: 'on', user: 'User', from: 'From', server: 'Server',
+    on: 'on', user: 'User', from: 'From', server: 'Server', needs: 'Approvals needed:',
     allow: 'Allow', once: 'Just this once', deny: 'Deny',
     approved_by: 'Approved by', denied_by: 'Denied by', valid_for: 'valid for', once_note: 'this once',
     expired: 'Expired, no answer in time', not_allowed: 'You are not an approver.',
     enroll: 'New server wants to enroll', reenroll: 'Server wants to replace its key', fingerprint: 'Key fingerprint',
     compare: 'Compare this with the fingerprint shown on the server.', add: 'Add server', added_by: 'Added by',
     admin_change: 'Configuration change', remove_host: 'Remove server', set_config: 'Change settings', confirm: 'Confirm',
-    status: { approved: 'Approved', denied: 'Denied', expired: 'Already expired', unknown: 'Unknown request' },
+    status: { approved: 'Approved', denied: 'Denied', expired: 'Already expired', pending: 'Noted, waiting for more approvals', unknown: 'Unknown request' },
   };
   if (lang !== 'nl') return en;
   return {
     title: { ssh: 'SSH-login', sudo: 'sudo' },
-    on: 'op', user: 'Gebruiker', from: 'Vanaf', server: 'Server',
+    on: 'op', user: 'Gebruiker', from: 'Vanaf', server: 'Server', needs: 'Akkoorden nodig:',
     allow: 'Toestaan', once: 'Alleen deze keer', deny: 'Weigeren',
     approved_by: 'Goedgekeurd door', denied_by: 'Geweigerd door', valid_for: 'geldig', once_note: 'alleen deze keer',
     expired: 'Verlopen, niet op tijd beantwoord', not_allowed: 'Je mag dit niet goedkeuren.',
     enroll: 'Nieuwe server wil zich aanmelden', reenroll: 'Server wil een nieuwe sleutel', fingerprint: 'Vingerafdruk sleutel',
     compare: 'Vergelijk dit met de vingerafdruk op de server.', add: 'Server toevoegen', added_by: 'Toegevoegd door',
     admin_change: 'Configuratiewijziging', remove_host: 'Server verwijderen', set_config: 'Instellingen wijzigen', confirm: 'Bevestigen',
-    status: { approved: 'Goedgekeurd', denied: 'Geweigerd', expired: 'Al verlopen', unknown: 'Onbekend verzoek' },
+    status: { approved: 'Goedgekeurd', denied: 'Geweigerd', expired: 'Al verlopen', pending: 'Genoteerd, wacht op meer akkoorden', unknown: 'Onbekend verzoek' },
   };
 }
 

@@ -147,6 +147,26 @@ request-access hosts remove web1
 
 Every change shows up on Telegram and only applies after you confirm it.
 
+### Who approves what
+
+By default every request goes to the approver chosen at setup. Routes send
+some requests elsewhere, or require more than one approver:
+
+```sh
+request-access route set web1 --approvers 111111111            # this server: someone else
+request-access route set user:deploy --approvers 111,222 --chat -100123456 --required 2
+request-access route set web1/user:root --approvers 333 --required 1
+request-access route                                            # list
+request-access route remove web1
+```
+
+The most specific route wins (`HOST/user:USER`, then `user:USER`, then
+`HOST`). With several approvers, pass a group chat that contains them and
+the bot; each approver taps once, and any "Just this once" makes the grant a
+one-off. Approvers must have started the bot (or be in the group) so it can
+reach them. Enrolling servers and configuration changes always go to the
+default approver.
+
 On a server:
 
 ```sh

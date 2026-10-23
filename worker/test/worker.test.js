@@ -213,3 +213,61 @@ test('remove host after approval', async () => {
   const state = await (await signed('admin:0', admin.priv, 'GET', '/v1/admin/state')).json();
   assert.deepEqual(state.hosts.map((h) => h.name), ['web1']);
 });
+
+test('routes: per host and per user, with several approvers', async () => {
+  const body = JSON.stringify({
+    action: 'set_config',
+    config: {
+      routes: {
+        web1: { chat: '-1001', approvers: ['111', '222'], required: 2 },
+        'user:ops': { approvers: ['333'] },
+      },
+    },
+    nonce: nonce(),
+  });
+  const { id: act } = await (await signed('admin:0', admin.priv, 'POST', '/v1/admin/actions', body)).json();
+  await click(`x:${act}:a`);
+
+  // host route: needs two distinct approvers, posted in the route's chat
+  let { id } = await (await signed('host:web1', host.priv, 'POST', '/v1/access', JSON.stringify({ service: 'ssh', user: 'alice', nonce: nonce() }))).json();
+  assert.equal(lastSend().params.chat_id, '-1001');
+  await click(`r:${id}:a`); // default approver is not on this route
+  await click(`r:${id}:a`, 111);
+  await click(`r:${id}:a`, 111); // same person twice does not count double
+  let st = await (await signed('host:web1', host.priv, 'GET', `/v1/access/${id}`)).json();
+  assert.equal(st.status, 'pending');
+  await click(`r:${id}:a`, 222);
+  st = await (await signed('host:web1', host.priv, 'GET', `/v1/access/${id}`)).json();
+  assert.equal(st.status, 'approved');
+
+  // user route beats host route
+  ({ id } = await (await signed('host:web1', host.priv, 'POST', '/v1/access', JSON.stringify({ service: 'ssh', user: 'ops', nonce: nonce() }))).json());
+  assert.equal(lastSend().params.chat_id, '333');
+  await click(`r:${id}:a`, 333);
+  st = await (await signed('host:web1', host.priv, 'GET', `/v1/access/${id}`)).json();
+  assert.equal(st.status, 'approved');
+
+  // admin changes stay with the default approver only
+  const b2 = JSON.stringify({ action: 'set_config', config: { routes: { web1: null, 'user:ops': null } }, nonce: nonce() });
+  const { id: act2 } = await (await signed('admin:0', admin.priv, 'POST', '/v1/admin/actions', b2)).json();
+  await click(`x:${act2}:a`, 111);
+  let state = await (await signed('admin:0', admin.priv, 'GET', '/v1/admin/state')).json();
+  assert.ok(state.config.routes.web1, 'route approver cannot confirm admin changes');
+  await click(`x:${act2}:a`);
+  state = await (await signed('admin:0', admin.priv, 'GET', '/v1/admin/state')).json();
+  assert.deepEqual(state.config.routes, {});
+});
+
+test('route validation', async () => {
+  const bad = [
+    { 'bad key!': { approvers: ['1'] } },
+    { web1: { approvers: [] } },
+    { web1: { approvers: ['abc'] } },
+    { web1: { approvers: ['1', '2'] } }, // several approvers need an explicit chat
+    { web1: { approvers: ['1'], required: 2 } },
+  ];
+  for (const routes of bad) {
+    const body = JSON.stringify({ action: 'set_config', config: { routes }, nonce: nonce() });
+    assert.equal((await signed('admin:0', admin.priv, 'POST', '/v1/admin/actions', body)).status, 400, JSON.stringify(routes));
+  }
+});

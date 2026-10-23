@@ -29,6 +29,11 @@ Admin (on your own machine):
   config    key=value ...                change settings (confirmed on Telegram), e.g.
                                          window.ssh=15m window.sudo=30m window.web1/sudo=5m
                                          request_timeout=60 default_window=15m max_window=1d lang=nl
+  route                                  list who approves what
+  route     set KEY --approvers ID[,ID] [--chat ID] [--required N]
+                                         KEY: HOST, user:USER or HOST/user:USER
+                                         (most specific wins; default: the setup approver)
+  route     remove KEY
   hosts                                  list enrolled servers
   hosts     remove NAME                  remove a server (confirmed on Telegram)
 
@@ -59,6 +64,8 @@ func main() {
 		err = cmdConfig(args)
 	case "hosts":
 		err = cmdHosts(args)
+	case "route", "routes":
+		err = cmdRoute(args)
 	case "enroll":
 		err = cmdEnroll(args)
 	case "install":
@@ -202,6 +209,54 @@ func cmdHosts(args []string) error {
 		fmt.Printf("%-24s %s  added %s\n", h.Name, h.Fingerprint, time.Unix(h.Added, 0).Format("2006-01-02"))
 	}
 	return nil
+}
+
+func cmdRoute(args []string) error {
+	st, err := admin.GetState()
+	if err != nil {
+		return err
+	}
+	routes := map[string]any{}
+	if r, ok := st.Config["routes"].(map[string]any); ok {
+		routes = r
+	}
+	if len(args) == 0 {
+		if len(routes) == 0 {
+			fmt.Println("No routes: every request goes to the default approver.")
+			return nil
+		}
+		keys := make([]string, 0, len(routes))
+		for k := range routes {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v, _ := json.Marshal(routes[k])
+			fmt.Printf("%-32s %s\n", k, v)
+		}
+		return nil
+	}
+	switch {
+	case args[0] == "remove" && len(args) == 2:
+		routes[args[1]] = nil
+	case args[0] == "set" && len(args) >= 2:
+		fs := flag.NewFlagSet("route set", flag.ExitOnError)
+		approvers := fs.String("approvers", "", "comma-separated Telegram user ids")
+		chat := fs.String("chat", "", "chat to post in (default: the only approver; use a group id for several)")
+		required := fs.Int("required", 1, "approvals needed")
+		fs.Parse(args[2:])
+		if *approvers == "" {
+			return fmt.Errorf("--approvers is required")
+		}
+		r := map[string]any{"approvers": strings.Split(*approvers, ","), "required": *required}
+		if *chat != "" {
+			r["chat"] = *chat
+		}
+		routes[args[1]] = r
+	default:
+		return fmt.Errorf("usage: route [set KEY --approvers IDS [--chat ID] [--required N] | remove KEY]")
+	}
+	return admin.SetConfig(map[string]any{"routes": routes}, printf)
 }
 
 func cmdEnroll(args []string) error {
