@@ -226,7 +226,7 @@ func Setup(o SetupOptions) error {
 			return err
 		}
 	}
-	o.Out("\nDone. Enroll a server with:\n  sudo request-access enroll --url %s --server-key %s --name <hostname>\n", workerURL, info.WorkerKey)
+	o.Out("\nDone. Enroll a server with:\n  sudo /usr/local/sbin/request-access enroll --url %s --server-key %s --name <hostname>\n", workerURL, info.WorkerKey)
 	return nil
 }
 

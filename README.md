@@ -95,7 +95,8 @@ servers. After upgrading the binary, `request-access setup --update
 ### 2. Add a server
 
 Copy the binary to `/usr/local/sbin/request-access` (root-owned, not
-writable by others), then as root:
+writable by others), then as root (use the full path with `sudo`; some
+distributions leave `/usr/local/sbin` out of sudo's `secure_path`):
 
 ```sh
 request-access enroll --url https://request-access.<you>.workers.dev --server-key <KEY> --name web1
@@ -111,6 +112,21 @@ request-access install --ssh --sudo [--exempt backup]
 Keep a root shell open and test from a second terminal before you log out.
 `request-access uninstall` removes the PAM rules again; the original PAM
 files are kept as `*.request-access.bak`.
+
+### SELinux
+
+On SELinux systems (Fedora, RHEL and derivatives) the SSH daemon may not
+open outgoing connections, so an SSH check fails closed with
+`connect: permission denied`. Allow `sshd` to reach web ports with a small
+local module, generated from the denial after a first (failed) login:
+
+```sh
+ausearch -m avc -ts recent -c request-access | audit2allow -M request-access
+semodule -i request-access.pp
+```
+
+The resulting rule is `allow sshd_t http_port_t:tcp_socket name_connect;`,
+which is narrower than the `nis_enabled` boolean.
 
 ### Exempting automation
 
