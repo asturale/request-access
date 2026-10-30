@@ -89,9 +89,11 @@ request-access passkey require off
   on the page.
 - **Passkeys are bound to the Worker's host name.** Moving the Worker to
   another URL means registering new passkeys.
-- **One signature approves.** Routes that require several approvers still
-  decide where the message goes, but a passkey request is approved by one
-  signature from any passkey pinned on that server.
+- **One signature approves.** On a route that requires several approvers,
+  the message keeps the usual tap buttons and offers no passkey link unless
+  the server has `passkey require on`; then one signature from any passkey
+  pinned on that server approves, so pin only the passkeys of people who may
+  approve on their own.
 - **Browsers inside apps.** Open the link in the system browser or Telegram's
   in-app Safari/Chrome tab; embedded web views often cannot use passkeys.
 - It does not change what root on a server can do: root can edit the

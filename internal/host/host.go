@@ -62,6 +62,15 @@ type PasskeyConfig struct {
 	Credentials []passkey.Credential `json:"credentials"`
 }
 
+// maxWait bounds how long the PAM check waits for an answer; the server's
+// request_timeout cannot exceed it.
+const maxWait = 10*time.Minute + 5*time.Second
+
+// pinned reports whether a credential id is still registered here.
+func (p *PasskeyConfig) pinned(id string) bool {
+	return p != nil && id != "" && slices.ContainsFunc(p.Credentials, func(c passkey.Credential) bool { return c.ID == id })
+}
+
 // active reports whether access requests should ask for a passkey.
 func (p *PasskeyConfig) active() bool { return p != nil && (p.Required || len(p.Credentials) > 0) }
 
@@ -270,7 +279,8 @@ func Check(r Request, out func(string)) Decision {
 	required := pk != nil && pk.Required
 	now := time.Now()
 	if c := loadGrant(srv, service, r.User); c != nil && c.Grant.Allows(cfg.Name, service, r.User, now) &&
-		(!required || c.Passkey) && (c.Until == 0 || now.Unix() < c.Until) {
+		(!required || c.Passkey) && (c.Until == 0 || now.Unix() < c.Until) &&
+		(!c.Passkey || pk.pinned(c.Credential)) {
 		return Decision{Allowed: true, Reason: "cached grant", Cached: true}
 	}
 	if required && len(pk.Credentials) == 0 {
@@ -279,6 +289,7 @@ func Check(r Request, out func(string)) Decision {
 
 	client := cfg.Client(key)
 	nonce := proto.Nonce()
+	started := time.Now()
 	body := map[string]any{
 		"service": service, "user": r.User, "rhost": r.RHost, "tty": r.TTY,
 		"detail": r.Detail, "nonce": nonce,
@@ -310,7 +321,12 @@ func Check(r Request, out func(string)) Decision {
 	} else {
 		out("Request Access: waiting for approval on Telegram...")
 	}
+	// Never wait longer than the host allows, whatever the server says: a
+	// server holding on to an approval must not be able to use it later.
 	deadline := time.Unix(created.Expires, 0).Add(5 * time.Second)
+	if limit := started.Add(maxWait); deadline.After(limit) {
+		deadline = limit
+	}
 	for time.Now().Before(deadline) {
 		var st struct {
 			Status  string             `json:"status"`
@@ -326,6 +342,9 @@ func Check(r Request, out func(string)) Decision {
 		case "approved":
 			if st.Grant == nil {
 				return Decision{Reason: "approved without grant"}
+			}
+			if !time.Now().Before(deadline) {
+				return Decision{Reason: "timed out"}
 			}
 			g, err := st.Grant.Verify(srv)
 			if err != nil {
@@ -346,7 +365,8 @@ func Check(r Request, out func(string)) Decision {
 				// window is this host's, not the server's.
 				once = once || signed == chOnce
 				c.Passkey = true
-				c.Until = time.Now().Unix() + pk.window()
+				c.Credential = cred.ID
+				c.Until = started.Unix() + pk.window()
 				reason = "approved with passkey " + cred.Label
 			} else if required {
 				return Decision{Reason: "approval has no passkey signature"}
@@ -520,9 +540,11 @@ func grantPath(service, user string) string {
 // itself verified (the directory is root-only, so these fields are trusted).
 type cachedGrant struct {
 	proto.SignedGrant
-	Passkey bool         `json:"passkey,omitempty"` // approved with a verified passkey
-	Until   int64        `json:"until,omitempty"`   // this host's own expiry, if any
-	Grant   *proto.Grant `json:"-"`
+	Passkey bool  `json:"passkey,omitempty"` // approved with a verified passkey
+	Until   int64 `json:"until,omitempty"`   // this host's own expiry, if any
+	// The passkey that approved; the grant stops counting once it is unpinned.
+	Credential string       `json:"credential,omitempty"`
+	Grant      *proto.Grant `json:"-"`
 }
 
 func loadGrant(srv ed25519.PublicKey, service, user string) *cachedGrant {
@@ -585,7 +607,8 @@ func ListGrants() ([]CachedGrant, error) {
 		}
 		out = append(out, CachedGrant{
 			Service: g.Service, User: g.User, Expires: time.Unix(exp, 0), Passkey: c.Passkey,
-			Valid: g.Allows(cfg.Name, g.Service, g.User, now) && now.Unix() < exp && (!required || c.Passkey),
+			Valid: g.Allows(cfg.Name, g.Service, g.User, now) && now.Unix() < exp && (!required || c.Passkey) &&
+				(!c.Passkey || cfg.Passkey.pinned(c.Credential)),
 		})
 	}
 	return out, nil

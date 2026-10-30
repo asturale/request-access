@@ -161,6 +161,9 @@ export class State {
       approvals: [],
       passkey: parsePasskeyRequest(r.passkey, url),
     };
+    // A passkey approval is one signature. Where a route asks for several
+    // approvers, keep the taps unless the host itself insists on a passkey.
+    if (req.passkey && req.required > 1 && !req.passkey.required) req.passkey = null;
     const t = texts(cfg.lang);
     const lines = [
       `🔐 <b>${esc(t.title[service] || service)}</b> ${esc(t.on)} <b>${esc(req.host)}</b>`,

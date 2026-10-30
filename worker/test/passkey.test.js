@@ -289,6 +289,13 @@ test('the last passkey cannot be removed while required; export round-trips', as
   assert.equal(r.code, 0);
   r = await run(['passkey', 'remove', 'phone']);
   assert.equal(r.code, 0, r.stderr);
+  // alice's grant came from the removed passkey: it no longer counts.
+  const before = messages.length;
+  nextTap = 'd';
+  r = await sudo('alice');
+  nextTap = null;
+  assert.notEqual(r.code, 0);
+  assert.equal(messages.length, before + 1, 'asked again');
   r = await run(['passkey', 'add', '--import', line]);
   assert.equal(r.code, 0, r.stderr);
   assert.equal(config().passkey.credentials[0].id, phone.id);
