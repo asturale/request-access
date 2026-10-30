@@ -35,6 +35,13 @@ remembered for 10 minutes; a reused nonce is rejected with 409.
 | POST   | `/v1/admin/actions`        | admin  | `{action: "set_config", config, nonce}` or `{action: "remove_host", name, nonce}` → `{id}` |
 | GET    | `/v1/admin/actions/<id>`   | admin  | `{status}` |
 | POST   | `/telegram/webhook`        | secret | Telegram updates (`X-Telegram-Bot-Api-Secret-Token`) |
+| POST   | `/v1/passkey/register`     | host   | `{label, challenge, rp_id, exclude?, nonce}` → `{id, expires}`; link on Telegram |
+| GET    | `/v1/passkey/register/<id>?wait=N` | host | `{status, registration?}` |
+| GET    | `/approve/<id>`, `/register/<id>` | none | the passkey pages |
+| GET    | `/v1/approve/<id>`         | none   | request details and challenges, for the page |
+| POST   | `/v1/approve/<id>`         | none   | `{choice: "window"\|"once", assertion}` |
+| GET    | `/v1/register/<id>`        | none   | registration details, for the page |
+| POST   | `/v1/register/<id>`        | none   | `{registration: {id, alg, public_key, client_data_json}}` |
 
 `wait` long-polls for up to 25 seconds.
 
@@ -77,3 +84,22 @@ always capped at `max_window`.
 An access request uses the most specific match, else the default approver;
 only that route's approvers can decide it, and it is approved once
 `required` distinct approvers tapped Allow (any Deny denies).
+
+## Passkeys
+
+An access request from a host with pinned passkeys adds
+
+```json
+"passkey": {"rp_id": "ra.example.workers.dev", "required": true,
+  "challenges": {"window": "<b64url>", "once": "<b64url>"},
+  "credentials": ["<credential id>"]}
+```
+
+where each challenge is base64url(SHA-256) over the length-prefixed lines
+`request-access passkey v1`, host, service, user, nonce and choice. When
+approved through the page, the status answer also carries
+`"passkey": {id, client_data_json, authenticator_data, signature}` (all
+base64url), which the host verifies against its pinned public keys (SPKI;
+ES256, EdDSA or RS256) before accepting the grant. With `required`,
+Telegram taps cannot approve and the host refuses grants without a valid
+signature. See [PASSKEYS.md](PASSKEYS.md).

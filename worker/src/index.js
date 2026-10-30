@@ -5,10 +5,15 @@
 // grant signed with a key that never leaves the Worker. Hosts only hold the
 // matching public key, so a compromised host cannot mint its own approvals.
 //
+// Hosts can additionally pin passkeys (see docs/PASSKEYS.md). Their requests
+// are approved on a page where the approver signs the host's challenge with
+// the passkey; the Worker only relays that signature and the host verifies
+// it, so even a replaced Worker cannot approve anything for such a host.
+//
 // All state lives in a single Durable Object (strongly consistent, unlike KV,
 // whose cross-location reads can lag by up to a minute).
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const MAX_SKEW = 60; // seconds between a signed request's timestamp and now
 const NONCE_TTL = 600; // seconds a request nonce is remembered (replay protection)
 const MAX_PENDING_ENROLLMENTS = 3;
@@ -64,12 +69,24 @@ export class State {
     let mm;
     if (m === 'GET' && (mm = p.match(/^\/v1\/enroll\/([0-9a-f]{32})$/))) return this.enrollStatus(mm[1], url);
 
+    // Passkey pages and what they post. Unauthenticated: the 128-bit id in
+    // the link (sent only to the approver's chat) finds the request, and the
+    // host verifies the passkey signature itself, so nothing posted here can
+    // approve anything on its own.
+    if (m === 'GET' && (mm = p.match(/^\/(approve|register)\/([0-9a-f]{32})$/))) return this.passkeyPage(mm[1], mm[2]);
+    if (m === 'GET' && (mm = p.match(/^\/v1\/approve\/([0-9a-f]{32})$/))) return this.approveInfo(mm[1]);
+    if (m === 'POST' && (mm = p.match(/^\/v1\/approve\/([0-9a-f]{32})$/))) return this.approveWithPasskey(mm[1], await request.text());
+    if (m === 'GET' && (mm = p.match(/^\/v1\/register\/([0-9a-f]{32})$/))) return this.registerInfo(mm[1]);
+    if (m === 'POST' && (mm = p.match(/^\/v1\/register\/([0-9a-f]{32})$/))) return this.registerPasskey(mm[1], await request.text());
+
     // Everything below requires a signed request.
     const body = m === 'GET' ? '' : await request.text();
     const caller = await this.authenticate(request, url, body);
 
-    if (m === 'POST' && p === '/v1/access') return this.createAccess(caller, body);
+    if (m === 'POST' && p === '/v1/access') return this.createAccess(caller, body, url);
     if (m === 'GET' && (mm = p.match(/^\/v1\/access\/([0-9a-f]{32})$/))) return this.accessStatus(caller, mm[1], url);
+    if (m === 'POST' && p === '/v1/passkey/register') return this.createRegistration(caller, body, url);
+    if (m === 'GET' && (mm = p.match(/^\/v1\/passkey\/register\/([0-9a-f]{32})$/))) return this.registrationStatus(caller, mm[1], url);
     if (m === 'GET' && p === '/v1/admin/state') return this.adminState(caller);
     if (m === 'POST' && p === '/v1/admin/actions') return this.createAdminAction(caller, body);
     if (m === 'GET' && (mm = p.match(/^\/v1\/admin\/actions\/([0-9a-f]{32})$/))) return this.adminActionStatus(caller, mm[1], url);
@@ -118,7 +135,7 @@ export class State {
 
   // ---------------------------------------------------------------- access
 
-  async createAccess(caller, body) {
+  async createAccess(caller, body, url) {
     if (caller.kind !== 'host') throw new HttpError(403, 'hosts only');
     const r = parseJson(body);
     await this.useNonce(caller.name, r.nonce);
@@ -142,6 +159,7 @@ export class State {
       status: 'pending',
       ...routeFor(cfg, this.env, caller.name, user),
       approvals: [],
+      passkey: parsePasskeyRequest(r.passkey, url),
     };
     const t = texts(cfg.lang);
     const lines = [
@@ -151,30 +169,27 @@ export class State {
     if (req.rhost) lines.push(`${esc(t.from)}: <code>${esc(req.rhost)}</code>`);
     if (req.tty) lines.push(`TTY: <code>${esc(req.tty)}</code>`);
     if (req.detail) lines.push(`<code>${esc(req.detail)}</code>`);
-    if (req.required > 1) lines.push(`👥 ${esc(t.needs)} ${req.required}`);
+    if (req.required > 1 && !req.passkey) lines.push(`👥 ${esc(t.needs)} ${req.required}`);
+    // With a passkey the approval happens on a page (the host checks the
+    // signature); hosts that require one get no tap-to-allow buttons.
+    const keyboard = [];
+    if (req.passkey) keyboard.push([{ text: `🔑 ${t.approve_passkey}`, url: `${url.origin}/approve/${id}` }]);
+    if (!req.passkey || !req.passkey.required) {
+      keyboard.push([
+        { text: `✅ ${t.allow} ${fmtDuration(req.window, cfg.lang)}`, callback_data: `r:${id}:a` },
+        { text: `☑️ ${t.once}`, callback_data: `r:${id}:o` },
+      ]);
+    }
+    keyboard.push([{ text: `❌ ${t.deny}`, callback_data: `r:${id}:d` }]);
     const sent = await this.telegram('sendMessage', {
       chat_id: req.chat,
       text: lines.join('\n'),
       parse_mode: 'HTML',
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: `✅ ${t.allow} ${fmtDuration(req.window, cfg.lang)}`, callback_data: `r:${id}:a` },
-            { text: `☑️ ${t.once}`, callback_data: `r:${id}:o` },
-          ],
-          [{ text: `❌ ${t.deny}`, callback_data: `r:${id}:d` }],
-        ],
-      },
+      reply_markup: { inline_keyboard: keyboard },
     });
     req.message_id = sent && sent.message_id;
     req.text = lines.join('\n');
-    req.keyboard = [
-      [
-        { text: `✅ ${t.allow} ${fmtDuration(req.window, cfg.lang)}`, callback_data: `r:${id}:a` },
-        { text: `☑️ ${t.once}`, callback_data: `r:${id}:o` },
-      ],
-      [{ text: `❌ ${t.deny}`, callback_data: `r:${id}:d` }],
-    ];
+    req.keyboard = keyboard;
     await this.storage.put('req:' + id, req);
     await this.scheduleAlarm(req.expires);
     return json({ id, expires: req.expires, window: req.window });
@@ -190,14 +205,19 @@ export class State {
       if (req.status !== 'pending' || Date.now() >= deadline) {
         const out = { status: req.status };
         if (req.status === 'approved') out.grant = req.grant;
+        if (req.status === 'approved' && req.assertion) out.passkey = req.assertion;
         return json(out);
       }
       await sleep(1000);
     }
   }
 
-  async decideAccess(req, choice, from) {
+  // choice: 'a' (allow for the window), 'o' (just this once) or 'd' (deny).
+  // assertion: set when the approver signed with a passkey on the approve
+  // page; it is handed to the host, which verifies it.
+  async decideAccess(req, choice, from, assertion = null) {
     if (req.status !== 'pending') return req.status;
+    if (choice !== 'd' && !assertion && req.passkey && req.passkey.required) return 'passkey_required';
     if (now() >= req.expires) {
       await this.expire(req);
       return 'expired';
@@ -212,12 +232,15 @@ export class State {
       // "Just this once" from any of them makes the grant a one-off.
       const id = String(from && from.id);
       if (!req.approvals.some((a) => a.id === id)) req.approvals.push({ id, who: who(from), once: choice === 'o' });
-      if (req.approvals.length < (req.required || 1)) {
+      if (assertion) req.assertion = assertion;
+      // A passkey approval is complete on its own: the host checks one
+      // signature and does not count Telegram taps.
+      if (!assertion && req.approvals.length < (req.required || 1)) {
         await this.editDecision(req, `⏳ ${req.approvals.length}/${req.required}: ${req.approvals.map((a) => a.who).join(', ')}`, true);
         await this.storage.put('req:' + req.id, req);
         return 'pending';
       }
-      const once = req.approvals.some((a) => a.once);
+      const once = assertion ? choice === 'o' : req.approvals.some((a) => a.once);
       const window = once ? 30 : req.window;
       const payload = {
         v: 1,
@@ -259,6 +282,142 @@ export class State {
     };
     if (keepButtons && req.keyboard) params.reply_markup = { inline_keyboard: req.keyboard };
     await this.telegram('editMessageText', params);
+  }
+
+  // ---------------------------------------------------------------- passkeys
+
+  // Data for the approve page; only for passkey requests.
+  async approveInfo(id) {
+    const req = await this.storage.get('req:' + id);
+    if (!req || !req.passkey) throw new HttpError(404, 'not found');
+    const cfg = await this.config();
+    return json({
+      lang: cfg.lang,
+      status: req.status === 'pending' && now() >= req.expires ? 'expired' : req.status,
+      host: req.host, service: req.service, user: req.user,
+      rhost: req.rhost, tty: req.tty, detail: req.detail,
+      window: req.window, expires: req.expires,
+      rp_id: req.passkey.rp_id,
+      challenges: req.passkey.challenges,
+      credentials: req.passkey.credentials,
+    });
+  }
+
+  async approveWithPasskey(id, body) {
+    const req = await this.storage.get('req:' + id);
+    if (!req || !req.passkey) throw new HttpError(404, 'not found');
+    const r = parseJson(body);
+    const choice = { window: 'a', once: 'o' }[r.choice];
+    if (!choice) throw new HttpError(400, 'bad choice');
+    const a = parseAssertion(r.assertion);
+    // A sanity check so a stray post cannot close the request; the real
+    // verification (signature, key, site, user verification) is the host's.
+    const cd = clientDataOf(a.client_data_json);
+    if (cd.type !== 'webauthn.get' || cd.challenge !== req.passkey.challenges[r.choice]) throw new HttpError(400, 'challenge does not match');
+    if (!req.passkey.credentials.includes(a.id)) throw new HttpError(400, 'unknown passkey');
+    const status = await this.decideAccess(req, choice, { id: 'passkey', first_name: 'passkey' }, a);
+    return json({ status });
+  }
+
+  // A host (as root) asks to register a passkey. The approver opens the link
+  // and creates the passkey on their phone; the host picks up the public key
+  // and pins it.
+  async createRegistration(caller, body, url) {
+    if (caller.kind !== 'host') throw new HttpError(403, 'hosts only');
+    const r = parseJson(body);
+    await this.useNonce(caller.name, r.nonce);
+    const label = str(r.label, 64);
+    if (!label) throw new HttpError(400, 'label required');
+    if (!isB64u(r.challenge, 43, 86)) throw new HttpError(400, 'bad challenge');
+    if (r.rp_id !== url.hostname) throw new HttpError(400, "rp_id must be this server's host name");
+    const exclude = credentialIds(r.exclude);
+    const t = texts((await this.config()).lang);
+    const id = randomHex(16);
+    const text = [
+      `🔑 <b>${esc(t.register_title)}</b>`,
+      `${esc(t.server)}: <b>${esc(caller.name)}</b>`,
+      `${esc(t.label)}: <code>${esc(label)}</code>`,
+      esc(t.register_hint),
+    ].join('\n');
+    const sent = await this.telegram('sendMessage', {
+      chat_id: this.env.TELEGRAM_CHAT_ID,
+      text,
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: `🔑 ${t.register_button}`, url: `${url.origin}/register/${id}` }],
+          [{ text: `❌ ${t.deny}`, callback_data: `p:${id}:d` }],
+        ],
+      },
+    });
+    const reg = {
+      id, host: caller.name, label, challenge: r.challenge, rp_id: r.rp_id, exclude,
+      status: 'pending', created: now(), expires: now() + 600, message_id: sent && sent.message_id, text,
+    };
+    await this.storage.put('reg:' + id, reg);
+    await this.scheduleAlarm(reg.expires);
+    return json({ id, expires: reg.expires });
+  }
+
+  async registerInfo(id) {
+    const reg = await this.storage.get('reg:' + id);
+    if (!reg) throw new HttpError(404, 'not found');
+    return json({
+      lang: (await this.config()).lang,
+      status: reg.status === 'pending' && now() >= reg.expires ? 'expired' : reg.status,
+      host: reg.host, label: reg.label, rp_id: reg.rp_id, challenge: reg.challenge, exclude: reg.exclude,
+      expires: reg.expires,
+    });
+  }
+
+  async registerPasskey(id, body) {
+    const reg = await this.storage.get('reg:' + id);
+    if (!reg) throw new HttpError(404, 'not found');
+    if (reg.status !== 'pending') return json({ status: reg.status });
+    if (now() >= reg.expires) return json({ status: 'expired' });
+    const r = parseJson(body).registration || {};
+    if (!isB64u(r.id, 1, 1400) || !isB64u(r.public_key, 32, 2048) || !isB64u(r.client_data_json, 1, 4096) || ![-7, -8, -257].includes(r.alg)) {
+      throw new HttpError(400, 'bad registration');
+    }
+    const cd = clientDataOf(r.client_data_json);
+    if (cd.type !== 'webauthn.create' || cd.challenge !== reg.challenge) throw new HttpError(400, 'challenge does not match');
+    reg.registration = { id: r.id, alg: r.alg, public_key: r.public_key, client_data_json: r.client_data_json };
+    reg.status = 'approved';
+    await this.storage.put('reg:' + id, reg);
+    const t = texts((await this.config()).lang);
+    await this.editMsg(reg, `✅ ${t.registered}\n${await fingerprint(r.public_key)}`);
+    return json({ status: reg.status });
+  }
+
+  async registrationStatus(caller, id, url) {
+    const wait = Math.min(Number(url.searchParams.get('wait') || 0), 25);
+    const deadline = Date.now() + wait * 1000;
+    for (;;) {
+      const reg = await this.storage.get('reg:' + id);
+      if (!reg || caller.kind !== 'host' || reg.host !== caller.name) throw new HttpError(404, 'not found');
+      if (reg.status === 'pending' && now() >= reg.expires) reg.status = 'expired';
+      if (reg.status !== 'pending' || Date.now() >= deadline) {
+        const out = { status: reg.status };
+        if (reg.status === 'approved') out.registration = reg.registration;
+        return json(out);
+      }
+      await sleep(1000);
+    }
+  }
+
+  async passkeyPage(kind, id) {
+    const obj = await this.storage.get((kind === 'approve' ? 'req:' : 'reg:') + id);
+    if (!obj || (kind === 'approve' && !obj.passkey)) return new Response('Not found', { status: 404 });
+    const nonce = b64u(crypto.getRandomValues(new Uint8Array(16)));
+    return new Response(PAGE.replace(/__NONCE__/g, nonce).replace('__KIND__', kind), {
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+        'Referrer-Policy': 'no-referrer',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+      },
+    });
   }
 
   // ---------------------------------------------------------------- enrollment
@@ -425,7 +584,7 @@ export class State {
       await this.telegram('answerCallbackQuery', { callback_query_id: cq.id, text: t.not_allowed });
       return json({ ok: true });
     };
-    const m = /^([rex]):([0-9a-f]{32}):([aod])$/.exec(cq.data || '');
+    const m = /^([rexp]):([0-9a-f]{32}):([aod])$/.exec(cq.data || '');
     let result = 'unknown';
     if (m) {
       const [, kind, id, choice] = m;
@@ -438,6 +597,14 @@ export class State {
         result = await this.decideAccess(req, choice, cq.from);
       } else if (!defaultApprovers(this.env).includes(fromId)) {
         return denyTap();
+      } else if (kind === 'p') {
+        const reg = await this.storage.get('reg:' + id);
+        if (reg && reg.status === 'pending' && choice === 'd') {
+          reg.status = 'denied';
+          await this.storage.put('reg:' + id, reg);
+          await this.editMsg(reg, `❌ ${t.denied_by} ${who(cq.from)}`);
+        }
+        result = reg ? reg.status : 'unknown';
       } else if (kind === 'e') {
         const enr = await this.storage.get('enr:' + id);
         if (enr) result = await this.decideEnroll(enr, choice === 'o' ? 'a' : choice, cq.from);
@@ -494,7 +661,7 @@ export class State {
     const t = now();
     let next = null;
     for (const [k, v] of await this.storage.list({ prefix: 'nonce:' })) if (v.exp < t) await this.storage.delete(k);
-    for (const prefix of ['req:', 'enr:', 'act:']) {
+    for (const prefix of ['req:', 'enr:', 'act:', 'reg:']) {
       for (const [k, v] of await this.storage.list({ prefix })) {
         if (v.status === 'pending' && t >= v.expires) {
           if (prefix === 'req:') await this.expire(v);
@@ -632,6 +799,46 @@ function validateConfig(c) {
   return out;
 }
 
+function isB64u(v, min, max) {
+  return typeof v === 'string' && v.length >= min && v.length <= max && /^[A-Za-z0-9_-]+$/.test(v);
+}
+
+function credentialIds(v) {
+  if (v === undefined || v === null) return [];
+  if (!Array.isArray(v) || v.length > 20 || !v.every((x) => isB64u(x, 1, 1400))) throw new HttpError(400, 'bad credential ids');
+  return v;
+}
+
+// The passkey part of an access request: the two challenges the host will
+// accept (approve for the window, or just this once) and the credentials
+// it has pinned.
+function parsePasskeyRequest(p, url) {
+  if (p === undefined || p === null) return null;
+  if (typeof p !== 'object') throw new HttpError(400, 'bad passkey');
+  if (p.rp_id !== url.hostname) throw new HttpError(400, "passkey rp_id must be this server's host name");
+  const c = p.challenges || {};
+  if (!isB64u(c.window, 43, 86) || !isB64u(c.once, 43, 86) || c.window === c.once) throw new HttpError(400, 'bad passkey challenges');
+  const credentials = credentialIds(p.credentials);
+  if (!credentials.length) throw new HttpError(400, 'no passkeys');
+  return { rp_id: p.rp_id, challenges: { window: c.window, once: c.once }, credentials, required: p.required === true };
+}
+
+function parseAssertion(a) {
+  if (!a || typeof a !== 'object' || !isB64u(a.id, 1, 1400) || !isB64u(a.client_data_json, 1, 4096) ||
+      !isB64u(a.authenticator_data, 37, 4096) || !isB64u(a.signature, 1, 1024)) {
+    throw new HttpError(400, 'bad assertion');
+  }
+  return { id: a.id, client_data_json: a.client_data_json, authenticator_data: a.authenticator_data, signature: a.signature };
+}
+
+function clientDataOf(s) {
+  try {
+    const v = JSON.parse(new TextDecoder().decode(b64uDecode(s)));
+    if (v && typeof v === 'object') return v;
+  } catch {}
+  throw new HttpError(400, 'bad client data');
+}
+
 function defaultApprovers(env) {
   return String(env.APPROVER_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
 }
@@ -674,7 +881,10 @@ function texts(lang) {
     enroll: 'New server wants to enroll', reenroll: 'Server wants to replace its key', fingerprint: 'Key fingerprint',
     compare: 'Compare this with the fingerprint shown on the server.', add: 'Add server', added_by: 'Added by',
     admin_change: 'Configuration change', remove_host: 'Remove server', set_config: 'Change settings', confirm: 'Confirm',
-    status: { approved: 'Approved', denied: 'Denied', expired: 'Already expired', pending: 'Noted, waiting for more approvals', unknown: 'Unknown request' },
+    approve_passkey: 'Approve with passkey', register_title: 'Register a passkey', label: 'Name',
+    register_hint: 'Only continue if you just started this on the server.', register_button: 'Create passkey',
+    registered: 'Passkey created; compare the fingerprint with the server:',
+    status: { approved: 'Approved', denied: 'Denied', expired: 'Already expired', pending: 'Noted, waiting for more approvals', unknown: 'Unknown request', passkey_required: 'This server needs your passkey: use the 🔑 button' },
   };
   if (lang !== 'nl') return en;
   return {
@@ -686,7 +896,10 @@ function texts(lang) {
     enroll: 'Nieuwe server wil zich aanmelden', reenroll: 'Server wil een nieuwe sleutel', fingerprint: 'Vingerafdruk sleutel',
     compare: 'Vergelijk dit met de vingerafdruk op de server.', add: 'Server toevoegen', added_by: 'Toegevoegd door',
     admin_change: 'Configuratiewijziging', remove_host: 'Server verwijderen', set_config: 'Instellingen wijzigen', confirm: 'Bevestigen',
-    status: { approved: 'Goedgekeurd', denied: 'Geweigerd', expired: 'Al verlopen', pending: 'Genoteerd, wacht op meer akkoorden', unknown: 'Onbekend verzoek' },
+    approve_passkey: 'Goedkeuren met passkey', register_title: 'Passkey registreren', label: 'Naam',
+    register_hint: 'Ga alleen verder als je dit net zelf op de server hebt gestart.', register_button: 'Passkey aanmaken',
+    registered: 'Passkey aangemaakt; vergelijk de vingerafdruk met de server:',
+    status: { approved: 'Goedgekeurd', denied: 'Geweigerd', expired: 'Al verlopen', pending: 'Genoteerd, wacht op meer akkoorden', unknown: 'Onbekend verzoek', passkey_required: 'Deze server vraagt je passkey: gebruik de 🔑-knop' },
   };
 }
 
@@ -728,3 +941,194 @@ function b64uDecode(s) {
   const b = atob(String(s).replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((String(s).length + 3) % 4));
   return Uint8Array.from(b, (c) => c.charCodeAt(0));
 }
+
+// ------------------------------------------------------------------ page
+
+// The approve and register page. Everything it shows comes from the API and
+// the host verifies what it signs, so the page holds no secrets. No
+// backticks or dollar-brace below: this is one template literal.
+const PAGE = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Request Access</title>
+<style nonce="__NONCE__">
+  :root { color-scheme: light dark; --fg: #1b1f24; --muted: #5d6670; --bg: #f6f7f9; --card: #fff; --line: #dde1e6; --ok: #1a7f37; --bad: #b42318; --accent: #1f5fbf; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #e8eaed; --muted: #9aa3ad; --bg: #111418; --card: #1a1e24; --line: #2c323a; --ok: #4ac26b; --bad: #f1707a; --accent: #3d7be0; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg); }
+  main { max-width: 26rem; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+  h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+  dl { margin: 0 0 1.25rem; padding: 1rem; background: var(--card); border: 1px solid var(--line); border-radius: 10px; display: grid; grid-template-columns: auto 1fr; gap: .35rem .9rem; }
+  dl:empty { display: none; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92rem; overflow-wrap: anywhere; }
+  button { display: block; width: 100%; padding: .85rem 1rem; margin: 0 0 .6rem; font: inherit; font-weight: 600; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #msg { min-height: 1.5rem; margin: .5rem 0 0; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .muted { color: var(--muted); font-size: .9rem; }
+  code.fp { display: block; margin-top: .4rem; font-size: .85rem; overflow-wrap: anywhere; color: var(--fg); }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Request Access</h1>
+  <dl id="facts"></dl>
+  <div id="actions"></div>
+  <p id="msg" role="status"></p>
+  <p class="muted" id="hint"></p>
+</main>
+<script nonce="__NONCE__">
+(function () {
+  var KIND = '__KIND__';
+  var id = location.pathname.split('/').pop();
+  var T = {
+    en: {
+      approve: 'Approve access', register: 'Register a passkey', server: 'Server', service: 'Service', user: 'User', from: 'From',
+      command: 'Command', name: 'Name', allow: 'Allow for ', once: 'Just this once', create: 'Create passkey',
+      approved: 'Approved. You can close this page.', registered: 'Passkey created. Check that the server shows the same fingerprint:',
+      denied: 'This request was denied.', expired: 'This request has expired.', done: 'This request was already answered.',
+      cancelled: 'Cancelled or not allowed. Try again.', unsupported: 'This browser cannot use passkeys. Open the link in Safari or Chrome.',
+      failed: 'Failed: ', hint_approve: 'Only approve what you started yourself just now.',
+      hint_register: 'Only continue if you just ran "passkey add" on this server yourself.', s: ' s', min: ' min', h: ' h', d: ' days'
+    },
+    nl: {
+      approve: 'Toegang goedkeuren', register: 'Passkey registreren', server: 'Server', service: 'Dienst', user: 'Gebruiker', from: 'Vanaf',
+      command: 'Opdracht', name: 'Naam', allow: 'Toestaan voor ', once: 'Alleen deze keer', create: 'Passkey aanmaken',
+      approved: 'Goedgekeurd. Je kunt deze pagina sluiten.', registered: 'Passkey aangemaakt. Controleer of de server dezelfde vingerafdruk toont:',
+      denied: 'Dit verzoek is geweigerd.', expired: 'Dit verzoek is verlopen.', done: 'Dit verzoek is al beantwoord.',
+      cancelled: 'Geannuleerd of niet toegestaan. Probeer opnieuw.', unsupported: 'Deze browser kan geen passkeys gebruiken. Open de link in Safari of Chrome.',
+      failed: 'Mislukt: ', hint_approve: 'Keur alleen goed wat je zelf net hebt gestart.',
+      hint_register: 'Ga alleen verder als je net zelf "passkey add" op deze server hebt gedraaid.', s: ' s', min: ' min', h: ' uur', d: ' dagen'
+    }
+  };
+  var t = T.en;
+  var $ = function (s) { return document.getElementById(s); };
+
+  function b64u(buf) {
+    var s = '', b = new Uint8Array(buf);
+    for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return btoa(s).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+  }
+  function unb64u(s) {
+    var b = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4));
+    return Uint8Array.from(b, function (c) { return c.charCodeAt(0); });
+  }
+  function msg(text, cls) { var m = $('msg'); m.textContent = text; m.className = cls || ''; }
+  function fact(k, v) {
+    if (!v) return;
+    var dt = document.createElement('dt'), dd = document.createElement('dd');
+    dt.textContent = k; dd.textContent = v;
+    $('facts').append(dt, dd);
+  }
+  function button(text, primary, onclick) {
+    var b = document.createElement('button');
+    b.textContent = text; if (primary) b.className = 'primary';
+    b.addEventListener('click', onclick);
+    $('actions').append(b);
+  }
+  function busy(on) { document.querySelectorAll('button').forEach(function (b) { b.disabled = on; }); }
+  function duration(s) {
+    if (s % 86400 === 0) return s / 86400 + t.d;
+    if (s % 3600 === 0) return s / 3600 + t.h;
+    if (s % 60 === 0) return s / 60 + t.min;
+    return s + t.s;
+  }
+  function closed(status) {
+    $('actions').textContent = '';
+    msg(t[status] || t.done, status === 'approved' ? 'ok' : 'bad');
+  }
+  function failed(e) {
+    busy(false);
+    msg(e && e.name === 'NotAllowedError' ? t.cancelled : t.failed + ((e && e.message) || e), 'bad');
+  }
+  async function post(path, body) {
+    var res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    var data = await res.json().catch(function () { return {}; });
+    if (!res.ok) throw new Error(data.error || res.status);
+    return data;
+  }
+
+  async function approve(info, choice) {
+    busy(true); msg('');
+    try {
+      var cred = await navigator.credentials.get({ publicKey: {
+        challenge: unb64u(info.challenges[choice]),
+        rpId: info.rp_id,
+        allowCredentials: info.credentials.map(function (c) { return { type: 'public-key', id: unb64u(c) }; }),
+        userVerification: 'required',
+        timeout: 120000
+      } });
+      var r = await post('/v1/approve/' + id, { choice: choice, assertion: {
+        id: b64u(cred.rawId),
+        client_data_json: b64u(cred.response.clientDataJSON),
+        authenticator_data: b64u(cred.response.authenticatorData),
+        signature: b64u(cred.response.signature)
+      } });
+      closed(r.status);
+    } catch (e) { failed(e); }
+  }
+
+  async function register(info) {
+    busy(true); msg('');
+    try {
+      var user = new Uint8Array(16); crypto.getRandomValues(user);
+      var cred = await navigator.credentials.create({ publicKey: {
+        rp: { id: info.rp_id, name: 'Request Access' },
+        user: { id: user, name: 'request-access ' + info.label, displayName: 'Request Access (' + info.label + ')' },
+        challenge: unb64u(info.challenge),
+        pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -8 }, { type: 'public-key', alg: -257 }],
+        authenticatorSelection: { residentKey: 'preferred', userVerification: 'required' },
+        excludeCredentials: (info.exclude || []).map(function (c) { return { type: 'public-key', id: unb64u(c) }; }),
+        attestation: 'none',
+        timeout: 120000
+      } });
+      if (typeof cred.response.getPublicKey !== 'function') throw new Error(t.unsupported);
+      var spki = cred.response.getPublicKey();
+      var r = await post('/v1/register/' + id, { registration: {
+        id: b64u(cred.rawId),
+        alg: cred.response.getPublicKeyAlgorithm(),
+        public_key: b64u(spki),
+        client_data_json: b64u(cred.response.clientDataJSON)
+      } });
+      if (r.status !== 'approved') return closed(r.status);
+      var fp = 'SHA256:' + b64u(await crypto.subtle.digest('SHA-256', spki));
+      $('actions').textContent = '';
+      msg(t.registered, 'ok');
+      var c = document.createElement('code'); c.className = 'fp'; c.textContent = fp;
+      $('msg').append(c);
+    } catch (e) { failed(e); }
+  }
+
+  async function main() {
+    var res = await fetch('/v1/' + KIND + '/' + id);
+    if (!res.ok) { msg(t.expired, 'bad'); return; }
+    var info = await res.json();
+    t = T[info.lang] || T.en;
+    document.documentElement.lang = info.lang === 'nl' ? 'nl' : 'en';
+    $('title').textContent = KIND === 'approve' ? t.approve : t.register;
+    $('hint').textContent = KIND === 'approve' ? t.hint_approve : t.hint_register;
+    fact(t.server, info.host);
+    if (KIND === 'approve') {
+      fact(t.service, info.service); fact(t.user, info.user); fact(t.from, info.rhost); fact('TTY', info.tty); fact(t.command, info.detail);
+    } else {
+      fact(t.name, info.label);
+    }
+    if (info.status !== 'pending') return closed(info.status);
+    if (!window.PublicKeyCredential || !navigator.credentials) { msg(t.unsupported, 'bad'); return; }
+    if (KIND === 'approve') {
+      button(t.allow + duration(info.window), true, function () { approve(info, 'window'); });
+      button(t.once, false, function () { approve(info, 'once'); });
+    } else {
+      button(t.create, true, function () { register(info); });
+    }
+  }
+  main().catch(failed);
+})();
+</script>
+</body>
+</html>
+`;

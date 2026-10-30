@@ -15,6 +15,7 @@ import (
 
 	"github.com/asturale/request-access/internal/admin"
 	"github.com/asturale/request-access/internal/host"
+	"github.com/asturale/request-access/internal/passkey"
 )
 
 var version = "dev"
@@ -43,6 +44,12 @@ Server (as root):
   uninstall                              remove the PAM rules
   status                                 show configuration and cached grants
   revoke    [--service S] [--user U]     forget cached grants
+  passkey                                list the passkeys this server checks itself
+  passkey   add --label NAME             register a passkey (link on Telegram, create it on your phone)
+  passkey   add --import ra-passkey:...  pin a passkey exported from another server
+  passkey   export [NAME]                print passkeys to copy to other servers
+  passkey   remove NAME                  unpin a passkey
+  passkey   require on|off               on: only a passkey approves (Telegram taps no longer do)
   pam                                    (called by pam_exec)
 
   version
@@ -79,6 +86,8 @@ func main() {
 		err = cmdStatus()
 	case "revoke":
 		err = cmdRevoke(args)
+	case "passkey", "passkeys":
+		err = cmdPasskey(args)
 	case "version", "--version":
 		fmt.Println(version)
 	case "help", "-h", "--help":
@@ -350,6 +359,13 @@ func cmdStatus() error {
 	if len(cfg.ExemptUsers) > 0 {
 		fmt.Printf("Exempt:    %s\n", strings.Join(cfg.ExemptUsers, ", "))
 	}
+	if p := cfg.Passkey; p != nil && len(p.Credentials) > 0 {
+		mode := "passkey or Telegram tap"
+		if p.Required {
+			mode = "required"
+		}
+		fmt.Printf("Passkeys:  %d (%s)\n", len(p.Credentials), mode)
+	}
 	grants, err := host.ListGrants()
 	if err != nil {
 		return err
@@ -359,7 +375,115 @@ func cmdStatus() error {
 		if g.Valid {
 			state = "valid for " + time.Until(g.Expires).Round(time.Second).String()
 		}
+		if g.Passkey {
+			state += ", passkey"
+		}
 		fmt.Printf("Grant:     %s %s (%s)\n", g.Service, g.User, state)
+	}
+	return nil
+}
+
+func cmdPasskey(args []string) error {
+	if len(args) == 0 || args[0] == "list" {
+		cfg, _, _, err := host.LoadConfig()
+		if err != nil {
+			return err
+		}
+		p := cfg.Passkey
+		if p == nil || len(p.Credentials) == 0 {
+			fmt.Println("No passkeys: approvals are Telegram taps. Register one with: passkey add --label NAME")
+			return nil
+		}
+		mode := "a passkey or a Telegram tap approves"
+		if p.Required {
+			mode = "only a passkey approves"
+		}
+		fmt.Printf("Site: %s (%s)\n", p.ID, mode)
+		for _, c := range p.Credentials {
+			fmt.Printf("%-20s %s  added %s\n", c.Label, c.Fingerprint(), time.Unix(c.Added, 0).Format("2006-01-02"))
+		}
+		return nil
+	}
+	if err := requireRoot(); err != nil {
+		return err
+	}
+	switch args[0] {
+	case "add":
+		fs := flag.NewFlagSet("passkey add", flag.ExitOnError)
+		label := fs.String("label", "", "a name for the passkey, e.g. phone")
+		imp := fs.String("import", "", "a passkey exported from another server (ra-passkey:...)")
+		fs.Parse(args[1:])
+		if *imp != "" {
+			cred, err := passkey.Import(*imp)
+			if err != nil {
+				return err
+			}
+			if *label != "" {
+				cred.Label = *label
+			}
+			if err := host.AddPasskey(*cred); err != nil {
+				return err
+			}
+			fmt.Printf("Added passkey %q (%s).\n", cred.Label, cred.Fingerprint())
+			return passkeyNextStep()
+		}
+		if *label == "" {
+			return fmt.Errorf("--label is required")
+		}
+		cred, err := host.RegisterPasskey(host.RegisterOptions{Label: *label, Out: printf})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Registered passkey %q.\nFingerprint: %s\n", cred.Label, cred.Fingerprint())
+		fmt.Println("Check that your phone showed the same fingerprint. To use it on other servers:")
+		fmt.Printf("  request-access passkey add --import %s\n", cred.Export())
+		return passkeyNextStep()
+	case "export":
+		cfg, _, _, err := host.LoadConfig()
+		if err != nil {
+			return err
+		}
+		if cfg.Passkey == nil {
+			return fmt.Errorf("no passkeys registered")
+		}
+		for _, c := range cfg.Passkey.Credentials {
+			if len(args) < 2 || args[1] == c.Label {
+				fmt.Println(c.Export())
+			}
+		}
+		return nil
+	case "remove":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: passkey remove NAME")
+		}
+		if err := host.RemovePasskey(args[1]); err != nil {
+			return err
+		}
+		fmt.Printf("Removed passkey %q.\n", args[1])
+		return nil
+	case "require":
+		if len(args) != 2 || (args[1] != "on" && args[1] != "off") {
+			return fmt.Errorf("usage: passkey require on|off")
+		}
+		if err := host.RequirePasskey(args[1] == "on"); err != nil {
+			return err
+		}
+		if args[1] == "on" {
+			fmt.Println("Only a passkey approves access to this server now.")
+			fmt.Println("Keep this root shell open and test from a second terminal before logging out.")
+		} else {
+			fmt.Println("A passkey or a Telegram tap approves access to this server now.")
+		}
+		return nil
+	}
+	return fmt.Errorf("usage: passkey [list|add|export|remove|require]")
+}
+
+func passkeyNextStep() error {
+	cfg, _, _, err := host.LoadConfig()
+	if err == nil && cfg.Passkey != nil && !cfg.Passkey.Required {
+		fmt.Println("Approvals now offer the passkey; Telegram taps still work too. Once a passkey")
+		fmt.Println("approval has worked, make it the only way with: request-access passkey require on")
 	}
 	return nil
 }

@@ -63,6 +63,12 @@ that is exploited directly is out of scope.
 PAM runs the check in the *account* phase, which runs for every SSH login
 (also public-key logins) and every `sudo` call (also `NOPASSWD` rules).
 
+By default the Worker is trusted: whoever can replace it (anyone with a
+Cloudflare token that may edit Workers on that account, or the account
+itself) can approve everything. If such a token lives on one of the machines
+you protect, pin a [passkey](docs/PASSKEYS.md) on your servers. They then
+check your phone's signature themselves, and the Worker only relays it.
+
 ## Setup
 
 You need:
@@ -175,6 +181,17 @@ request-access revoke    # forget cached grants (all, or --service/--user)
 ```
 
 Each decision is logged to syslog (`authpriv`, tag `request-access`).
+
+### Passkeys
+
+```sh
+request-access passkey add --label phone   # link on Telegram, create the passkey on your phone
+request-access passkey require on          # from now on only the passkey approves
+```
+
+Approving then means opening the link in the Telegram message and confirming
+with Face ID, fingerprint or device PIN; the server verifies the signature
+itself. See [docs/PASSKEYS.md](docs/PASSKEYS.md).
 
 ## Break-glass
 
