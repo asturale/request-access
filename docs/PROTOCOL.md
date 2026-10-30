@@ -67,7 +67,7 @@ with payload
 A host accepts a fresh grant only if the signature verifies with the
 server key it pinned at enrollment, and `id`, `nonce`, `host`, `service` and
 `user` match its request. It may cache the grant (unless `once`) and reuse
-it for the same service and user until `exp`.
+it for the same service, user and remote host (`PAM_RHOST`) until `exp`.
 
 ## Configuration
 

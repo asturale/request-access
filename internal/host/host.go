@@ -278,9 +278,7 @@ func Check(r Request, out func(string)) Decision {
 	pk := cfg.Passkey
 	required := pk != nil && pk.Required
 	now := time.Now()
-	if c := loadGrant(srv, service, r.User); c != nil && c.Grant.Allows(cfg.Name, service, r.User, now) &&
-		(!required || c.Passkey) && (c.Until == 0 || now.Unix() < c.Until) &&
-		(!c.Passkey || pk.pinned(c.Credential)) {
+	if c := loadGrant(srv, service, r.User); c != nil && c.usable(cfg, service, r.User, r.RHost, now) {
 		return Decision{Allowed: true, Reason: "cached grant", Cached: true}
 	}
 	if required && len(pk.Credentials) == 0 {
@@ -353,7 +351,7 @@ func Check(r Request, out func(string)) Decision {
 			if g.Nonce != nonce || g.ID != created.ID || !g.Allows(cfg.Name, service, r.User, time.Now()) {
 				return Decision{Reason: "grant does not match this request"}
 			}
-			c := cachedGrant{SignedGrant: *st.Grant}
+			c := cachedGrant{SignedGrant: *st.Grant, RHost: r.RHost}
 			once := g.Once
 			reason := "approved"
 			if st.Passkey != nil && pk.active() {
@@ -543,8 +541,22 @@ type cachedGrant struct {
 	Passkey bool  `json:"passkey,omitempty"` // approved with a verified passkey
 	Until   int64 `json:"until,omitempty"`   // this host's own expiry, if any
 	// The passkey that approved; the grant stops counting once it is unpinned.
-	Credential string       `json:"credential,omitempty"`
-	Grant      *proto.Grant `json:"-"`
+	Credential string `json:"credential,omitempty"`
+	// The remote host (PAM_RHOST) the approval was for; the grant only
+	// counts for attempts from that same source. Empty for local services.
+	RHost string       `json:"rhost,omitempty"`
+	Grant *proto.Grant `json:"-"`
+}
+
+// usable reports whether a verified cached grant still lets this attempt in.
+// It only covers the source it was approved for: approving a login from one
+// machine must not let another one in during the window.
+func (c *cachedGrant) usable(cfg *Config, service, user, rhost string, now time.Time) bool {
+	pk := cfg.Passkey
+	required := pk != nil && pk.Required
+	return c.RHost == rhost && c.Grant.Allows(cfg.Name, service, user, now) &&
+		(!required || c.Passkey) && (c.Until == 0 || now.Unix() < c.Until) &&
+		(!c.Passkey || pk.pinned(c.Credential))
 }
 
 func loadGrant(srv ed25519.PublicKey, service, user string) *cachedGrant {
