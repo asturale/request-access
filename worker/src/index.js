@@ -13,10 +13,12 @@
 // All state lives in a single Durable Object (strongly consistent, unlike KV,
 // whose cross-location reads can lag by up to a minute).
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const MAX_SKEW = 60; // seconds between a signed request's timestamp and now
 const NONCE_TTL = 600; // seconds a request nonce is remembered (replay protection)
 const MAX_PENDING_ENROLLMENTS = 3;
+const VAULT_TIMEOUT = 300; // seconds a vault request stays open (unlocking a password manager takes a moment)
+const MAX_PENDING_VAULT = 10; // open vault requests per host
 
 const DEFAULT_CONFIG = {
   lang: 'en',
@@ -79,6 +81,13 @@ export class State {
     if (m === 'GET' && (mm = p.match(/^\/v1\/register\/([0-9a-f]{32})$/))) return this.registerInfo(mm[1]);
     if (m === 'POST' && (mm = p.match(/^\/v1\/register\/([0-9a-f]{32})$/))) return this.registerPasskey(mm[1], await request.text());
 
+    // Secrets vault pages (docs/VAULT.md). Unauthenticated like the passkey
+    // pages: releasing a secret needs the vault password, which only the
+    // approver has, and the result is sealed to the requesting host.
+    if (m === 'GET' && (mm = p.match(/^\/vault\/(setup|trust|release)\/([0-9a-f]{32})$/))) return this.vaultPage(mm[1], mm[2]);
+    if (m === 'GET' && (mm = p.match(/^\/v1\/vault\/page\/(setup|trust|release)\/([0-9a-f]{32})$/))) return this.vaultInfo(mm[1], mm[2]);
+    if (m === 'POST' && (mm = p.match(/^\/v1\/vault\/page\/(setup|trust|release)\/([0-9a-f]{32})$/))) return this.vaultSubmit(mm[1], mm[2], await request.text());
+
     // Everything below requires a signed request.
     const body = m === 'GET' ? '' : await request.text();
     const caller = await this.authenticate(request, url, body);
@@ -87,6 +96,12 @@ export class State {
     if (m === 'GET' && (mm = p.match(/^\/v1\/access\/([0-9a-f]{32})$/))) return this.accessStatus(caller, mm[1], url);
     if (m === 'POST' && p === '/v1/passkey/register') return this.createRegistration(caller, body, url);
     if (m === 'GET' && (mm = p.match(/^\/v1\/passkey\/register\/([0-9a-f]{32})$/))) return this.registrationStatus(caller, mm[1], url);
+    if (m === 'POST' && p === '/v1/vault/init') return this.vaultLink(caller, body, url, 'setup');
+    if (m === 'POST' && p === '/v1/vault/trust') return this.vaultLink(caller, body, url, 'trust');
+    if (m === 'GET' && (mm = p.match(/^\/v1\/vault\/(init|trust)\/([0-9a-f]{32})$/))) return this.vaultLinkStatus(caller, mm[2], url);
+    if (m === 'GET' && p === '/v1/vault/key') return this.vaultKey(caller);
+    if (m === 'POST' && p === '/v1/vault/request') return this.vaultRequest(caller, body, url);
+    if (m === 'GET' && (mm = p.match(/^\/v1\/vault\/request\/([0-9a-f]{32})$/))) return this.vaultRequestStatus(caller, mm[1], url);
     if (m === 'GET' && p === '/v1/admin/state') return this.adminState(caller);
     if (m === 'POST' && p === '/v1/admin/actions') return this.createAdminAction(caller, body);
     if (m === 'GET' && (mm = p.match(/^\/v1\/admin\/actions\/([0-9a-f]{32})$/))) return this.adminActionStatus(caller, mm[1], url);
@@ -423,6 +438,243 @@ export class State {
     });
   }
 
+  // ---------------------------------------------------------------- vault
+
+  // A host (as root) asks to create the vault ("setup") or to be trusted by
+  // the existing one ("trust"). The approver opens the link and enters the
+  // vault password; the page creates the key pair, or adds the host's key to
+  // the trusted hosts inside the locked vault key. Only the public key and the
+  // password-encrypted private key ever come back here.
+  async vaultLink(caller, body, url, kind) {
+    if (caller.kind !== 'host') throw new HttpError(403, 'hosts only');
+    const r = parseJson(body);
+    await this.useNonce(caller.name, r.nonce);
+    const vault = await this.storage.get('vault');
+    if (kind === 'setup' && vault) throw new HttpError(409, 'a vault already exists; pin its key with: vault pin');
+    if (kind === 'trust' && !vault) throw new HttpError(404, 'no vault yet; create one with: vault init');
+    const host = await this.storage.get('host:' + caller.name);
+    const t = texts((await this.config()).lang);
+    const id = randomHex(16);
+    const text = [
+      `🗝️ <b>${esc(kind === 'setup' ? t.vault_setup_title : t.vault_trust_title)}</b>`,
+      `${esc(t.server)}: <b>${esc(caller.name)}</b>`,
+      `${esc(t.fingerprint)}: <code>${esc(host.fp)}</code>`,
+      esc(t.register_hint),
+    ].join('\n');
+    const sent = await this.telegram('sendMessage', {
+      chat_id: this.env.TELEGRAM_CHAT_ID,
+      text,
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: `🗝️ ${kind === 'setup' ? t.vault_setup_button : t.vault_trust_button}`, url: `${url.origin}/vault/${kind}/${id}` }],
+          [{ text: `❌ ${t.deny}`, callback_data: `s:${id}:d` }],
+        ],
+      },
+    });
+    const set = {
+      id, kind, host: caller.name, host_key: host.key, host_fp: host.fp,
+      status: 'pending', created: now(), expires: now() + 900, message_id: sent && sent.message_id, text,
+    };
+    await this.storage.put('vset:' + id, set);
+    await this.scheduleAlarm(set.expires);
+    return json({ id, expires: set.expires });
+  }
+
+  async vaultLinkStatus(caller, id, url) {
+    const wait = Math.min(Number(url.searchParams.get('wait') || 0), 25);
+    const deadline = Date.now() + wait * 1000;
+    for (;;) {
+      const set = await this.storage.get('vset:' + id);
+      if (!set || caller.kind !== 'host' || set.host !== caller.name) throw new HttpError(404, 'not found');
+      if (set.status === 'pending' && now() >= set.expires) set.status = 'expired';
+      if (set.status !== 'pending' || Date.now() >= deadline) {
+        const out = { status: set.status };
+        if (set.status === 'approved') out.key = set.key;
+        return json(out);
+      }
+      await sleep(1000);
+    }
+  }
+
+  async vaultKey(caller) {
+    if (caller.kind !== 'host') throw new HttpError(403, 'hosts only');
+    const vault = await this.storage.get('vault');
+    if (!vault) throw new HttpError(404, 'no vault yet; create one with: vault init');
+    return json({ key: vault.key, fingerprint: vault.fp });
+  }
+
+  // A host asks to release one secret to one of its users. The request is
+  // signed with the host key and carries the secret sealed to the vault key
+  // and a fresh key to seal the released secret to; the Worker can read
+  // neither, and the page checks the signature against the trusted hosts
+  // inside the locked vault key, so the Worker cannot change any of it.
+  async vaultRequest(caller, body, url) {
+    if (caller.kind !== 'host') throw new HttpError(403, 'hosts only');
+    const r = parseJson(body);
+    await this.useNonce(caller.name, r.nonce);
+    const vault = await this.storage.get('vault');
+    if (!vault) throw new HttpError(404, 'no vault yet');
+    if (r.vault_key !== vault.key) throw new HttpError(409, 'this host pinned a different vault key');
+    const name = typeof r.name === 'string' ? r.name : '';
+    const user = typeof r.user === 'string' ? r.user : '';
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || !user || user.length > 64) throw new HttpError(400, 'name and user required');
+    // Signed fields are kept exactly as sent (no truncation), or refused.
+    const reason = r.reason === undefined ? '' : r.reason;
+    const detail = r.detail === undefined ? '' : r.detail;
+    if (typeof reason !== 'string' || typeof detail !== 'string' || reason.length > 600 || detail.length > 800) throw new HttpError(400, 'bad reason or detail');
+    const box = boxOf(r.box);
+    if (!isB64u(r.reply_key, 87, 87)) throw new HttpError(400, 'bad reply key');
+    if (!isB64u(r.sig, 86, 86)) throw new HttpError(400, 'bad signature');
+    const open = (await this.list('vreq:')).filter((v) => v.host === caller.name && v.status === 'pending');
+    if (open.length >= MAX_PENDING_VAULT) throw new HttpError(429, 'too many open vault requests');
+    const t = texts((await this.config()).lang);
+    const id = randomHex(16);
+    const req = {
+      id, host: caller.name, user, name, reason, detail, box,
+      reply_key: r.reply_key, nonce: r.nonce, sig: r.sig,
+      status: 'pending', created: now(), expires: now() + VAULT_TIMEOUT,
+    };
+    const lines = [
+      `🗝️ <b>${esc(t.vault_title)}</b> <code>${esc(name)}</code> ${esc(t.on)} <b>${esc(req.host)}</b>`,
+      `${esc(t.user)}: <code>${esc(user)}</code>`,
+    ];
+    if (reason) lines.push(`${esc(t.reason)}: ${esc(reason)}`);
+    if (detail) lines.push(`<code>${esc(detail)}</code>`);
+    const sent = await this.telegram('sendMessage', {
+      chat_id: this.env.TELEGRAM_CHAT_ID,
+      text: lines.join('\n'),
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: `🔓 ${t.vault_release}`, url: `${url.origin}/vault/release/${id}` }],
+          [{ text: `❌ ${t.deny}`, callback_data: `v:${id}:d` }],
+        ],
+      },
+    });
+    req.message_id = sent && sent.message_id;
+    req.text = lines.join('\n');
+    await this.storage.put('vreq:' + id, req);
+    await this.scheduleAlarm(req.expires);
+    return json({ id, expires: req.expires });
+  }
+
+  // The sealed secret is handed out once, then forgotten.
+  async vaultRequestStatus(caller, id, url) {
+    const wait = Math.min(Number(url.searchParams.get('wait') || 0), 25);
+    const deadline = Date.now() + wait * 1000;
+    for (;;) {
+      const req = await this.storage.get('vreq:' + id);
+      if (!req || caller.kind !== 'host' || req.host !== caller.name) throw new HttpError(404, 'not found');
+      if (req.status === 'pending' && now() >= req.expires) req.status = 'expired';
+      if (req.status !== 'pending' || Date.now() >= deadline) {
+        const out = { status: req.status };
+        if (req.status === 'approved') {
+          if (!req.sealed) throw new HttpError(410, 'already delivered');
+          out.sealed = req.sealed;
+          delete req.sealed;
+          req.delivered = now();
+          await this.storage.put('vreq:' + id, req);
+        }
+        return json(out);
+      }
+      await sleep(1000);
+    }
+  }
+
+  // Data for the vault page.
+  async vaultInfo(kind, id) {
+    const lang = (await this.config()).lang;
+    const vault = await this.storage.get('vault');
+    const vaultOut = vault ? { key: vault.key, locked: vault.locked, fingerprint: vault.fp, auth_salt: vault.auth.salt } : null;
+    if (kind === 'setup' || kind === 'trust') {
+      const set = await this.storage.get('vset:' + id);
+      if (!set || set.kind !== kind) throw new HttpError(404, 'not found');
+      if (kind === 'trust' && !vault) throw new HttpError(404, 'no vault');
+      return json({
+        lang, status: set.status === 'pending' && now() >= set.expires ? 'expired' : set.status,
+        host: set.host, host_key: set.host_key, host_fp: set.host_fp, expires: set.expires,
+        vault: kind === 'trust' ? vaultOut : null,
+      });
+    }
+    const req = await this.storage.get('vreq:' + id);
+    if (!req || !vault) throw new HttpError(404, 'not found');
+    return json({
+      lang,
+      status: req.status === 'pending' && now() >= req.expires ? 'expired' : req.status,
+      host: req.host, user: req.user, name: req.name, reason: req.reason, detail: req.detail, expires: req.expires,
+      box: req.box, reply_key: req.reply_key, nonce: req.nonce, sig: req.sig,
+      vault: vaultOut,
+    });
+  }
+
+  // What the page posts: the new vault (setup), the re-locked vault key with
+  // one more trusted host (trust), or the sealed secret (release).
+  async vaultSubmit(kind, id, body) {
+    const r = parseJson(body);
+    const t = texts((await this.config()).lang);
+    if (kind === 'release') {
+      const req = await this.storage.get('vreq:' + id);
+      if (!req) throw new HttpError(404, 'not found');
+      if (req.status !== 'pending') return json({ status: req.status });
+      if (now() >= req.expires) return json({ status: 'expired' });
+      req.sealed = boxOf(r.sealed);
+      req.status = 'approved';
+      req.decided = now();
+      await this.storage.put('vreq:' + id, req);
+      await this.editMsg(req, `✅ ${t.vault_released}`);
+      return json({ status: req.status });
+    }
+    const set = await this.storage.get('vset:' + id);
+    if (!set || set.kind !== kind) throw new HttpError(404, 'not found');
+    if (set.status !== 'pending') return json({ status: set.status });
+    if (now() >= set.expires) return json({ status: 'expired' });
+    let vault = await this.storage.get('vault');
+    if (kind === 'setup') {
+      if (vault) throw new HttpError(409, 'a vault already exists');
+      const a = r.auth || {};
+      if (!isB64u(a.salt, 22, 43) || !isB64u(a.hash, 43, 43)) throw new HttpError(400, 'bad auth');
+      vault = { key: vaultKeyOf(r.key), locked: lockedOf(r.locked), auth: { salt: a.salt, hash: a.hash }, created: now() };
+      vault.fp = await fingerprint(vault.key);
+    } else {
+      if (!vault) throw new HttpError(404, 'no vault');
+      // Changing the lock needs proof of the vault password (a second,
+      // separately salted derivation of it), so a leaked link alone cannot
+      // overwrite the vault key. Earlier locks are kept as well.
+      if (!isB64u(r.proof, 43, 43) || !timingSafeEqual(b64u(await sha256(b64uDecode(r.proof))), vault.auth.hash)) {
+        throw new HttpError(403, 'wrong vault password');
+      }
+      // Two trust pages open at once must not undo each other: a change is
+      // only accepted on top of the lock it was made from.
+      if (r.base !== vault.locked.iv) throw new HttpError(409, 'the vault changed meanwhile; reload this page and try again');
+      const hist = (await this.storage.get('vault_hist')) || [];
+      hist.push({ locked: vault.locked, until: now() });
+      await this.storage.put('vault_hist', hist.slice(-20));
+      vault = { ...vault, locked: lockedOf(r.locked), updated: now() };
+    }
+    await this.storage.put('vault', vault);
+    set.status = 'approved';
+    set.key = vault.key;
+    await this.storage.put('vset:' + id, set);
+    await this.editMsg(set, kind === 'setup' ? `✅ ${t.vault_created}\n${vault.fp}` : `✅ ${t.vault_trusted}`);
+    return json({ status: set.status, fingerprint: vault.fp });
+  }
+
+  async vaultPage(kind, id) {
+    const obj = await this.storage.get((kind === 'release' ? 'vreq:' : 'vset:') + id);
+    if (!obj || (kind !== 'release' && obj.kind !== kind)) return new Response('Not found', { status: 404 });
+    const nonce = b64u(crypto.getRandomValues(new Uint8Array(16)));
+    return new Response(VAULT_PAGE.replace(/__NONCE__/g, nonce).replace('__KIND__', kind), {
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+        'Referrer-Policy': 'no-referrer',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+      },
+    });
+  }
+
   // ---------------------------------------------------------------- enrollment
 
   // A new host asks to be enrolled. Unauthenticated by necessity (the host has
@@ -587,7 +839,7 @@ export class State {
       await this.telegram('answerCallbackQuery', { callback_query_id: cq.id, text: t.not_allowed });
       return json({ ok: true });
     };
-    const m = /^([rexp]):([0-9a-f]{32}):([aod])$/.exec(cq.data || '');
+    const m = /^([rexpvs]):([0-9a-f]{32}):([aod])$/.exec(cq.data || '');
     let result = 'unknown';
     if (m) {
       const [, kind, id, choice] = m;
@@ -608,6 +860,16 @@ export class State {
           await this.editMsg(reg, `❌ ${t.denied_by} ${who(cq.from)}`);
         }
         result = reg ? reg.status : 'unknown';
+      } else if (kind === 'v' || kind === 's') {
+        // Vault messages only carry Deny; releasing needs the page.
+        const k = (kind === 'v' ? 'vreq:' : 'vset:') + id;
+        const v = await this.storage.get(k);
+        if (v && v.status === 'pending' && choice === 'd') {
+          v.status = 'denied';
+          await this.storage.put(k, v);
+          await this.editMsg(v, `❌ ${t.denied_by} ${who(cq.from)}`);
+        }
+        result = v ? v.status : 'unknown';
       } else if (kind === 'e') {
         const enr = await this.storage.get('enr:' + id);
         if (enr) result = await this.decideEnroll(enr, choice === 'o' ? 'a' : choice, cq.from);
@@ -664,7 +926,7 @@ export class State {
     const t = now();
     let next = null;
     for (const [k, v] of await this.storage.list({ prefix: 'nonce:' })) if (v.exp < t) await this.storage.delete(k);
-    for (const prefix of ['req:', 'enr:', 'act:', 'reg:']) {
+    for (const prefix of ['req:', 'enr:', 'act:', 'reg:', 'vreq:', 'vset:']) {
       for (const [k, v] of await this.storage.list({ prefix })) {
         if (v.status === 'pending' && t >= v.expires) {
           if (prefix === 'req:') await this.expire(v);
@@ -826,6 +1088,28 @@ function parsePasskeyRequest(p, url) {
   return { rp_id: p.rp_id, challenges: { window: c.window, once: c.once }, credentials, required: p.required === true };
 }
 
+// Vault shapes: a raw P-256 public key (65 bytes), the password-locked
+// private key, and an ECIES box (see internal/vault/crypto.go).
+function vaultKeyOf(k) {
+  if (!isB64u(k, 87, 87)) throw new HttpError(400, 'bad vault key');
+  return k;
+}
+
+function lockedOf(l) {
+  if (!l || typeof l !== 'object' || l.kdf !== 'pbkdf2-sha256' || !Number.isInteger(l.iter) || l.iter < 100000 || l.iter > 10000000 ||
+      !isB64u(l.salt, 22, 43) || !isB64u(l.iv, 16, 16) || !isB64u(l.ct, 32, 16384)) {
+    throw new HttpError(400, 'bad locked key');
+  }
+  return { kdf: l.kdf, iter: l.iter, salt: l.salt, iv: l.iv, ct: l.ct };
+}
+
+function boxOf(b) {
+  if (!b || typeof b !== 'object' || b.v !== 1 || !isB64u(b.epk, 87, 87) || !isB64u(b.iv, 16, 16) || !isB64u(b.ct, 22, 22000)) {
+    throw new HttpError(400, 'bad box');
+  }
+  return { v: 1, epk: b.epk, iv: b.iv, ct: b.ct };
+}
+
 function parseAssertion(a) {
   if (!a || typeof a !== 'object' || !isB64u(a.id, 1, 1400) || !isB64u(a.client_data_json, 1, 4096) ||
       !isB64u(a.authenticator_data, 37, 4096) || !isB64u(a.signature, 1, 1024)) {
@@ -887,6 +1171,9 @@ function texts(lang) {
     approve_passkey: 'Approve with passkey', register_title: 'Register a passkey', label: 'Name',
     register_hint: 'Only continue if you just started this on the server.', register_button: 'Create passkey',
     registered: 'Passkey created; compare the fingerprint with the server:',
+    vault_setup_title: 'Create the secrets vault', vault_setup_button: 'Create vault', vault_created: 'Vault created; compare the fingerprint with the server:',
+    vault_trust_title: 'Trust a server for the vault', vault_trust_button: 'Trust server', vault_trusted: 'Server trusted',
+    vault_title: 'Secret', reason: 'Reason', vault_release: 'Open to release', vault_released: 'Released',
     status: { approved: 'Approved', denied: 'Denied', expired: 'Already expired', pending: 'Noted, waiting for more approvals', unknown: 'Unknown request', passkey_required: 'This server needs your passkey: use the 🔑 button' },
   };
   if (lang !== 'nl') return en;
@@ -902,6 +1189,9 @@ function texts(lang) {
     approve_passkey: 'Goedkeuren met passkey', register_title: 'Passkey registreren', label: 'Naam',
     register_hint: 'Ga alleen verder als je dit net zelf op de server hebt gestart.', register_button: 'Passkey aanmaken',
     registered: 'Passkey aangemaakt; vergelijk de vingerafdruk met de server:',
+    vault_setup_title: 'Kluis voor geheimen aanmaken', vault_setup_button: 'Kluis aanmaken', vault_created: 'Kluis aangemaakt; vergelijk de vingerafdruk met de server:',
+    vault_trust_title: 'Server toevoegen aan de kluis', vault_trust_button: 'Server vertrouwen', vault_trusted: 'Server vertrouwd',
+    vault_title: 'Geheim', reason: 'Reden', vault_release: 'Openen om vrij te geven', vault_released: 'Vrijgegeven',
     status: { approved: 'Goedgekeurd', denied: 'Geweigerd', expired: 'Al verlopen', pending: 'Genoteerd, wacht op meer akkoorden', unknown: 'Onbekend verzoek', passkey_required: 'Deze server vraagt je passkey: gebruik de 🔑-knop' },
   };
 }
@@ -1130,6 +1420,295 @@ const PAGE = `<!DOCTYPE html>
     }
   }
   main().catch(failed);
+})();
+</script>
+</body>
+</html>
+`;
+
+// ------------------------------------------------------------------ vault page
+
+// The vault setup and release page. The vault password never leaves this
+// page: it unlocks the vault's private key here, which opens the one
+// requested secret, which is sealed to the requesting host's fresh key.
+// The block between CRYPTO-BEGIN and CRYPTO-END is also run by the tests.
+// No backticks, dollar-brace or backslashes below: this is a template literal.
+const VAULT_PAGE = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Secrets vault</title>
+<style nonce="__NONCE__">
+  :root { color-scheme: light dark; --fg: #1b1f24; --muted: #5d6670; --bg: #f6f7f9; --card: #fff; --line: #dde1e6; --ok: #1a7f37; --bad: #b42318; --accent: #1f5fbf; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #e8eaed; --muted: #9aa3ad; --bg: #111418; --card: #1a1e24; --line: #2c323a; --ok: #4ac26b; --bad: #f1707a; --accent: #3d7be0; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg); }
+  main { max-width: 26rem; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+  h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+  dl { margin: 0 0 1.25rem; padding: 1rem; background: var(--card); border: 1px solid var(--line); border-radius: 10px; display: grid; grid-template-columns: auto 1fr; gap: .35rem .9rem; }
+  dl:empty { display: none; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92rem; overflow-wrap: anywhere; }
+  form { display: none; }
+  label { display: block; margin: 0 0 .3rem; color: var(--muted); font-size: .9rem; }
+  input { display: block; width: 100%; padding: .75rem .85rem; margin: 0 0 .8rem; font: inherit; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+  input.user { display: none; }
+  button { display: block; width: 100%; padding: .85rem 1rem; margin: 0 0 .6rem; font: inherit; font-weight: 600; border-radius: 10px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #msg { min-height: 1.5rem; margin: .5rem 0 0; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .muted { color: var(--muted); font-size: .9rem; }
+  code.fp { display: block; margin-top: .4rem; font-size: .85rem; overflow-wrap: anywhere; color: var(--fg); }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Secrets vault</h1>
+  <dl id="facts"></dl>
+  <form id="form" autocomplete="on">
+    <input class="user" type="text" name="username" autocomplete="username" value="secrets-vault" readonly>
+    <label for="pw" id="pwlabel">Vault password</label>
+    <input id="pw" type="password" name="password" required>
+    <div id="pw2box"><label for="pw2" id="pw2label">Repeat</label><input id="pw2" type="password" name="password2" autocomplete="new-password"></div>
+    <button id="go" type="submit">OK</button>
+  </form>
+  <p id="msg" role="status"></p>
+  <p class="muted" id="hint"></p>
+</main>
+<script nonce="__NONCE__">
+// CRYPTO-BEGIN
+var NL = String.fromCharCode(10);
+var ITER = 600000;
+var enc = new TextEncoder();
+function b64u(buf) {
+  var s = '', b = new Uint8Array(buf);
+  for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+  return btoa(s).split('+').join('-').split('/').join('_').split('=').join('');
+}
+function unb64u(s) {
+  var t = String(s).split('-').join('+').split('_').join('/');
+  while (t.length % 4) t += '=';
+  return Uint8Array.from(atob(t), function (c) { return c.charCodeAt(0); });
+}
+function cat(a, b) { var o = new Uint8Array(a.length + b.length); o.set(a); o.set(b, a.length); return o; }
+var P256 = { name: 'ECDH', namedCurve: 'P-256' };
+async function boxKey(shared, epk, recipient) {
+  var ikm = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: cat(epk, recipient), info: enc.encode('secrets-vault v1') },
+    ikm, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function seal(recipientRaw, plaintext, aad) {
+  var recip = await crypto.subtle.importKey('raw', recipientRaw, P256, false, []);
+  var eph = await crypto.subtle.generateKey(P256, true, ['deriveBits']);
+  var shared = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: recip }, eph.privateKey, 256));
+  var epk = new Uint8Array(await crypto.subtle.exportKey('raw', eph.publicKey));
+  var key = await boxKey(shared, epk, recipientRaw);
+  var iv = crypto.getRandomValues(new Uint8Array(12));
+  var ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv, additionalData: aad }, key, plaintext));
+  return { v: 1, epk: b64u(epk), iv: b64u(iv), ct: b64u(ct) };
+}
+async function openBox(priv, privPubRaw, box, aad) {
+  if (!box || box.v !== 1) throw new Error('unsupported box');
+  var epk = unb64u(box.epk);
+  var pub = await crypto.subtle.importKey('raw', epk, P256, false, []);
+  var shared = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: pub }, priv, 256));
+  var key = await boxKey(shared, epk, privPubRaw);
+  return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64u(box.iv), additionalData: aad }, key, unb64u(box.ct)));
+}
+async function passwordKey(password, salt, iter) {
+  var base = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt: salt, iterations: iter }, base,
+    { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+function lockAAD(pub) { return enc.encode('secrets-vault key v1' + NL + pub); }
+async function fingerprintOf(key) { return 'SHA256:' + b64u(await crypto.subtle.digest('SHA-256', unb64u(key))); }
+// The locked vault key: the PKCS#8 private key and the trusted hosts
+// ({name: Ed25519 public key}), encrypted with the vault password.
+async function lock(pub, content, password) {
+  var salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+  var k = await passwordKey(password, salt, ITER);
+  var plain = enc.encode(JSON.stringify(content));
+  var ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv, additionalData: lockAAD(pub) }, k, plain));
+  plain.fill(0);
+  return { kdf: 'pbkdf2-sha256', iter: ITER, salt: b64u(salt), iv: b64u(iv), ct: b64u(ct) };
+}
+async function unlock(vault, password) {
+  var l = vault.locked;
+  if (!l || l.kdf !== 'pbkdf2-sha256' || !(l.iter >= 100000)) throw new Error('unsupported vault');
+  var k = await passwordKey(password, unb64u(l.salt), l.iter);
+  var plain;
+  try {
+    plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64u(l.iv), additionalData: lockAAD(vault.key) }, k, unb64u(l.ct)));
+  } catch (e) { var err = new Error('wrong password'); err.wrongPassword = true; throw err; }
+  var content = JSON.parse(new TextDecoder().decode(plain));
+  plain.fill(0);
+  if (!content || typeof content.key !== 'string' || !content.hosts || typeof content.hosts !== 'object') throw new Error('unsupported vault');
+  return content;
+}
+// A second derivation of the password, with its own salt: the Worker keeps
+// only its hash, and asks for it before it accepts a changed lock.
+async function passwordProof(password, salt) {
+  var base = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  return new Uint8Array(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: salt, iterations: ITER }, base, 256));
+}
+async function createVault(password, host, hostKey) {
+  var kp = await crypto.subtle.generateKey(P256, true, ['deriveBits']);
+  var pub = b64u(await crypto.subtle.exportKey('raw', kp.publicKey));
+  var hosts = {}; hosts[host] = hostKey;
+  var content = { key: b64u(await crypto.subtle.exportKey('pkcs8', kp.privateKey)), hosts: hosts };
+  var authSalt = crypto.getRandomValues(new Uint8Array(16));
+  var proof = await passwordProof(password, authSalt);
+  return { key: pub, locked: await lock(pub, content, password),
+    auth: { salt: b64u(authSalt), hash: b64u(await crypto.subtle.digest('SHA-256', proof)) } };
+}
+async function trustHost(vault, password, host, hostKey) {
+  var content = await unlock(vault, password);
+  content.hosts[host] = hostKey;
+  return { locked: await lock(vault.key, content, password), proof: b64u(await passwordProof(password, unb64u(vault.auth_salt))), base: vault.locked.iv };
+}
+// What the host signed (see RequestMessage in internal/vault/crypto.go):
+// length-prefixed lines, the box as a SHA-256 hash.
+async function requestMessage(info) {
+  var h = b64u(await crypto.subtle.digest('SHA-256', enc.encode(info.box.epk + '.' + info.box.iv + '.' + info.box.ct)));
+  var fields = ['secrets-vault request v1', info.host, info.user, info.name, info.reason || '', info.detail || '', info.reply_key, info.nonce, h];
+  var out = new Uint8Array(0);
+  for (var i = 0; i < fields.length; i++) {
+    var f = enc.encode(fields[i]);
+    out = cat(cat(cat(out, enc.encode(f.length + ':')), f), enc.encode(NL));
+  }
+  return out;
+}
+async function releaseSecret(vault, password, info) {
+  var content = await unlock(vault, password);
+  var hostKey = content.hosts[info.host];
+  if (!hostKey) { var e1 = new Error('this server is not trusted by the vault'); e1.untrusted = true; throw e1; }
+  var pk = await crypto.subtle.importKey('raw', unb64u(hostKey), { name: 'Ed25519' }, false, ['verify']);
+  if (!(await crypto.subtle.verify({ name: 'Ed25519' }, pk, unb64u(info.sig), await requestMessage(info)))) {
+    var e2 = new Error('the request is not signed by this server'); e2.badSignature = true; throw e2;
+  }
+  var pkcs8 = unb64u(content.key);
+  var priv = await crypto.subtle.importKey('pkcs8', pkcs8, P256, false, ['deriveBits']);
+  pkcs8.fill(0);
+  var secret = await openBox(priv, unb64u(vault.key), info.box, enc.encode('secrets-vault secret v1' + NL + info.host + NL + info.name));
+  var sealed = await seal(unb64u(info.reply_key), secret, enc.encode('secrets-vault release v1' + NL + info.nonce + NL + info.name));
+  secret.fill(0);
+  return sealed;
+}
+// CRYPTO-END
+(function () {
+  var KIND = '__KIND__';
+  var id = location.pathname.split('/').pop();
+  var T = {
+    en: {
+      setup: 'Create the secrets vault', trust: 'Trust a server for the vault', release: 'Release a secret',
+      server: 'Server', server_key: 'Server key', user: 'User', secret: 'Secret',
+      reason: 'Reason', command: 'Command', vault: 'Vault', pw: 'Vault password', pw2: 'Repeat the password',
+      create: 'Create vault', trust_btn: 'Trust server', release_btn: 'Release',
+      created: 'Vault created. Check that the server shows the same fingerprint:', trusted: 'Server trusted. You can close this page.',
+      approved: 'Released. You can close this page.', denied: 'This request was denied.', expired: 'This request has expired.',
+      done: 'This request was already answered.', wrong: 'Wrong password.', mismatch: 'The passwords differ.',
+      untrusted: 'This server is not trusted by the vault. Run "vault pin" on it first.',
+      badsig: 'This request was not signed by the server it claims to come from. Do not release it.',
+      short: 'Use at least 16 characters; let your password manager generate one.', busy: 'Working...', failed: 'Failed: ',
+      hint_setup: 'Save this password in your password manager. Without it, the secrets cannot be recovered. Check that the server key matches what the server printed.',
+      hint_trust: 'Only continue if you just ran "vault pin" on this server, and the server key matches what it printed.',
+      hint_release: 'Only release what you started yourself just now. The secret goes only to this request.'
+    },
+    nl: {
+      setup: 'Kluis voor geheimen aanmaken', trust: 'Server toevoegen aan de kluis', release: 'Geheim vrijgeven',
+      server: 'Server', server_key: 'Serversleutel', user: 'Gebruiker', secret: 'Geheim',
+      reason: 'Reden', command: 'Opdracht', vault: 'Kluis', pw: 'Kluiswachtwoord', pw2: 'Herhaal het wachtwoord',
+      create: 'Kluis aanmaken', trust_btn: 'Server vertrouwen', release_btn: 'Vrijgeven',
+      created: 'Kluis aangemaakt. Controleer of de server dezelfde vingerafdruk toont:', trusted: 'Server vertrouwd. Je kunt deze pagina sluiten.',
+      approved: 'Vrijgegeven. Je kunt deze pagina sluiten.', denied: 'Dit verzoek is geweigerd.', expired: 'Dit verzoek is verlopen.',
+      done: 'Dit verzoek is al beantwoord.', wrong: 'Onjuist wachtwoord.', mismatch: 'De wachtwoorden verschillen.',
+      untrusted: 'Deze server wordt niet door de kluis vertrouwd. Draai daar eerst "vault pin".',
+      badsig: 'Dit verzoek is niet ondertekend door de server waar het van zegt te komen. Niet vrijgeven.',
+      short: 'Gebruik minstens 16 tekens; laat je wachtwoordmanager er een maken.', busy: 'Bezig...', failed: 'Mislukt: ',
+      hint_setup: 'Bewaar dit wachtwoord in je wachtwoordmanager. Zonder dit wachtwoord zijn de geheimen niet terug te halen. Controleer of de serversleutel klopt met wat de server toonde.',
+      hint_trust: 'Ga alleen verder als je net zelf "vault pin" op deze server draaide en de serversleutel klopt met wat de server toonde.',
+      hint_release: 'Geef alleen vrij wat je zelf net hebt gestart. Het geheim gaat alleen naar dit verzoek.'
+    }
+  };
+  var t = T.en;
+  var $ = function (s) { return document.getElementById(s); };
+  function msg(text, cls) { var m = $('msg'); m.textContent = text; m.className = cls || ''; }
+  function fact(k, v) {
+    if (!v) return;
+    var dt = document.createElement('dt'), dd = document.createElement('dd');
+    dt.textContent = k; dd.textContent = v;
+    $('facts').append(dt, dd);
+  }
+  function closed(status) { $('form').style.display = 'none'; msg(t[status] || t.done, status === 'approved' ? 'ok' : 'bad'); }
+  async function post(body) {
+    var res = await fetch('/v1/vault/page/' + KIND + '/' + id, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    var data = await res.json().catch(function () { return {}; });
+    if (!res.ok) throw new Error(data.error || res.status);
+    return data;
+  }
+  function problem(text) { var e = new Error(text); e.shown = true; return e; }
+  async function submit(info) {
+    var pw = $('pw').value;
+    $('go').disabled = true; msg(t.busy);
+    try {
+      if (KIND === 'setup') {
+        if (pw.length < 16) throw problem(t.short);
+        if (pw !== $('pw2').value) throw problem(t.mismatch);
+        var v = await createVault(pw, info.host, info.host_key);
+        var r = await post(v);
+        if (r.status !== 'approved') return closed(r.status);
+        $('form').style.display = 'none';
+        msg(t.created, 'ok');
+        var c = document.createElement('code'); c.className = 'fp'; c.textContent = await fingerprintOf(v.key);
+        $('msg').append(c);
+      } else if (KIND === 'trust') {
+        var r1 = await post(await trustHost(info.vault, pw, info.host, info.host_key));
+        $('pw').value = '';
+        if (r1.status === 'approved') { $('form').style.display = 'none'; msg(t.trusted, 'ok'); } else closed(r1.status);
+      } else {
+        var sealed = await releaseSecret(info.vault, pw, info);
+        $('pw').value = '';
+        closed((await post({ sealed: sealed })).status);
+      }
+    } catch (e) {
+      $('go').disabled = false;
+      msg(e && e.wrongPassword ? t.wrong : e && e.untrusted ? t.untrusted : e && e.badSignature ? t.badsig :
+        e && e.shown ? e.message : t.failed + ((e && e.message) || e), 'bad');
+    }
+  }
+  async function main() {
+    var res = await fetch('/v1/vault/page/' + KIND + '/' + id);
+    if (!res.ok) { msg(t.expired, 'bad'); return; }
+    var info = await res.json();
+    t = T[info.lang] || T.en;
+    document.documentElement.lang = info.lang === 'nl' ? 'nl' : 'en';
+    $('title').textContent = t[KIND];
+    $('hint').textContent = t['hint_' + KIND];
+    $('pwlabel').textContent = t.pw; $('pw2label').textContent = t.pw2;
+    fact(t.server, info.host);
+    if (KIND === 'release') {
+      fact(t.secret, info.name); fact(t.user, info.user); fact(t.reason, info.reason); fact(t.command, info.detail);
+      fact(t.vault, info.vault.fingerprint);
+    } else {
+      fact(t.server_key, info.host_fp);
+      if (info.vault) fact(t.vault, info.vault.fingerprint);
+    }
+    if (KIND === 'setup') {
+      $('pw').setAttribute('autocomplete', 'new-password');
+      $('pw').setAttribute('minlength', '16');
+      $('go').textContent = t.create;
+    } else {
+      $('pw').setAttribute('autocomplete', 'current-password');
+      $('pw2box').style.display = 'none';
+      $('go').textContent = KIND === 'trust' ? t.trust_btn : t.release_btn;
+    }
+    if (info.status !== 'pending') return closed(info.status);
+    $('form').style.display = 'block';
+    $('form').addEventListener('submit', function (ev) { ev.preventDefault(); submit(info); });
+    $('pw').focus();
+  }
+  main().catch(function (e) { msg(t.failed + ((e && e.message) || e), 'bad'); });
 })();
 </script>
 </body>

@@ -48,6 +48,14 @@ type Config struct {
 	// Passkeys whose signature this host checks itself (see
 	// docs/PASSKEYS.md).
 	Passkey *PasskeyConfig `json:"passkey,omitempty"`
+	// Vault pins the secrets vault's public key (see docs/VAULT.md): new
+	// secrets are encrypted to this key, never to one the server hands out.
+	Vault *VaultConfig `json:"vault,omitempty"`
+}
+
+// VaultConfig is the pinned vault key.
+type VaultConfig struct {
+	Key string `json:"key"` // P-256 public key, raw, base64url
 }
 
 // PasskeyConfig pins the approvers' passkeys on this host.
@@ -648,4 +656,9 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
+}
+
+// WriteFileAtomic writes a file via a temporary file and a rename.
+func WriteFileAtomic(path string, data []byte, mode os.FileMode) error {
+	return writeFileAtomic(path, data, mode)
 }

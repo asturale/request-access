@@ -50,7 +50,17 @@ Server (as root):
   passkey   export [NAME]                print passkeys to copy to other servers
   passkey   remove NAME                  unpin a passkey
   passkey   require on|off               on: only a passkey approves (Telegram taps no longer do)
+  vault     init                         create the secrets vault (pick its password on the page)
+  vault     pin --fingerprint FP         pin the existing vault key (compare FP with another server)
+  vault     add NAME --users U[,@GROUP] [--env VAR]   store a secret (read from stdin)
+  vault     list | remove NAME           show or delete stored secrets
+  vault     agent                        serve secret requests (run by request-access-vault.service)
+  vault     install                      install and start that service
   pam                                    (called by pam_exec)
+
+Any user:
+  vault     run NAME [-r REASON] [--env VAR] -- COMMAND...   run COMMAND with the secret in $VAR
+  vault     get NAME [-r REASON]         print the secret (after approval)
 
   version
 `
@@ -88,6 +98,8 @@ func main() {
 		err = cmdRevoke(args)
 	case "passkey", "passkeys":
 		err = cmdPasskey(args)
+	case "vault":
+		err = cmdVault(args)
 	case "version", "--version":
 		fmt.Println(version)
 	case "help", "-h", "--help":

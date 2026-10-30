@@ -193,6 +193,19 @@ Approving then means opening the link in the Telegram message and confirming
 with Face ID, fingerprint or device PIN; the server verifies the signature
 itself. See [docs/PASSKEYS.md](docs/PASSKEYS.md).
 
+### Secrets vault
+
+Store API tokens on a server so that nobody there, root included, can read
+them until you release one, for one request, with your vault password:
+
+```sh
+request-access vault init                                   # once: create the vault
+request-access vault add cloudflare --users alice --env CF_TOKEN   # secret on stdin
+request-access vault run cloudflare -r "update DNS" -- ./update-dns.sh
+```
+
+See [docs/VAULT.md](docs/VAULT.md), including what it does not protect.
+
 ## Break-glass
 
 If Telegram or Cloudflare is unreachable, protected logins and `sudo` are
