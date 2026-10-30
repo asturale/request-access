@@ -124,7 +124,7 @@ What it does not protect:
 | GET | `/v1/vault/page/(setup\|trust\|release)/<id>` | none | data for the page |
 | POST | `/v1/vault/page/setup/<id>` | none | `{key, locked, auth: {salt, hash}}` |
 | POST | `/v1/vault/page/trust/<id>` | none | `{locked, proof, base}`; `base` is the `iv` of the lock it was made from, refused if the lock changed meanwhile; earlier locks are kept |
-| POST | `/v1/vault/page/release/<id>` | none | `{sealed}` |
+| POST | `/v1/vault/page/release/<id>` | none | `{sealed, proof}` |
 
 A box is `{v: 1, epk, iv, ct}` (base64url): `epk` is an ephemeral P-256
 public key; the AES-256-GCM key is HKDF-SHA256 over the ECDH secret with salt
@@ -141,8 +141,9 @@ The locked vault key is `{kdf: "pbkdf2-sha256", iter, salt, iv, ct}`: AES-256-GC
 over the JSON `{"key": <PKCS#8 private key>, "hosts": {<name>: <Ed25519 key>}}`,
 with authenticated data `secrets-vault key v1\n<vault public key>`.
 
-Changing the lock (trusting another server) needs proof of the vault
-password: at setup the page derives a second PBKDF2 value from it with its
+Releasing a secret and changing the lock (trusting another server) need
+proof of the vault password: at setup the page derives a second PBKDF2 value from it with its
 own salt and the Worker keeps only its SHA-256 (`auth`); a trust post must
-include that value (`proof`). A leaked link therefore cannot overwrite the
-vault key, and the last 20 locks are kept in any case.
+include that value (`proof`). A leaked link therefore cannot close a
+request or overwrite the vault key, and the last 20 locks are kept in any
+case. The page data carries the locked key only while a request is open.

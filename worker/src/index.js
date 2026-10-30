@@ -599,12 +599,14 @@ export class State {
     }
     const req = await this.storage.get('vreq:' + id);
     if (!req || !vault) throw new HttpError(404, 'not found');
+    const status = req.status === 'pending' && now() >= req.expires ? 'expired' : req.status;
     return json({
       lang,
-      status: req.status === 'pending' && now() >= req.expires ? 'expired' : req.status,
+      status,
       host: req.host, user: req.user, name: req.name, reason: req.reason, detail: req.detail, expires: req.expires,
       box: req.box, reply_key: req.reply_key, nonce: req.nonce, sig: req.sig,
-      vault: vaultOut,
+      // The locked key only while the request is open.
+      vault: status === 'pending' ? vaultOut : { fingerprint: vault.fp },
     });
   }
 
@@ -618,6 +620,8 @@ export class State {
       if (!req) throw new HttpError(404, 'not found');
       if (req.status !== 'pending') return json({ status: req.status });
       if (now() >= req.expires) return json({ status: 'expired' });
+      // Only someone with the vault password can close the request.
+      if (!(await this.vaultProof(r.proof))) throw new HttpError(403, 'wrong vault password');
       req.sealed = boxOf(r.sealed);
       req.status = 'approved';
       req.decided = now();
@@ -641,9 +645,7 @@ export class State {
       // Changing the lock needs proof of the vault password (a second,
       // separately salted derivation of it), so a leaked link alone cannot
       // overwrite the vault key. Earlier locks are kept as well.
-      if (!isB64u(r.proof, 43, 43) || !timingSafeEqual(b64u(await sha256(b64uDecode(r.proof))), vault.auth.hash)) {
-        throw new HttpError(403, 'wrong vault password');
-      }
+      if (!(await this.vaultProof(r.proof))) throw new HttpError(403, 'wrong vault password');
       // Two trust pages open at once must not undo each other: a change is
       // only accepted on top of the lock it was made from.
       if (r.base !== vault.locked.iv) throw new HttpError(409, 'the vault changed meanwhile; reload this page and try again');
@@ -658,6 +660,12 @@ export class State {
     await this.storage.put('vset:' + id, set);
     await this.editMsg(set, kind === 'setup' ? `✅ ${t.vault_created}\n${vault.fp}` : `✅ ${t.vault_trusted}`);
     return json({ status: set.status, fingerprint: vault.fp });
+  }
+
+  // Checks a proof of the vault password (see passwordProof on the page).
+  async vaultProof(proof) {
+    const vault = await this.storage.get('vault');
+    return !!vault && isB64u(proof, 43, 43) && timingSafeEqual(b64u(await sha256(b64uDecode(proof))), vault.auth.hash);
   }
 
   async vaultPage(kind, id) {
@@ -1593,7 +1601,7 @@ async function releaseSecret(vault, password, info) {
   var secret = await openBox(priv, unb64u(vault.key), info.box, enc.encode('secrets-vault secret v1' + NL + info.host + NL + info.name));
   var sealed = await seal(unb64u(info.reply_key), secret, enc.encode('secrets-vault release v1' + NL + info.nonce + NL + info.name));
   secret.fill(0);
-  return sealed;
+  return { sealed: sealed, proof: b64u(await passwordProof(password, unb64u(vault.auth_salt))) };
 }
 // CRYPTO-END
 (function () {
@@ -1667,9 +1675,9 @@ async function releaseSecret(vault, password, info) {
         $('pw').value = '';
         if (r1.status === 'approved') { $('form').style.display = 'none'; msg(t.trusted, 'ok'); } else closed(r1.status);
       } else {
-        var sealed = await releaseSecret(info.vault, pw, info);
+        var rel = await releaseSecret(info.vault, pw, info);
         $('pw').value = '';
-        closed((await post({ sealed: sealed })).status);
+        closed((await post(rel)).status);
       }
     } catch (e) {
       $('go').disabled = false;

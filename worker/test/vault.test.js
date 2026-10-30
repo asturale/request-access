@@ -29,6 +29,7 @@ let vaultAction = { password: PASSWORD };
 let last = null; // what happened with the last vault message
 let seq = 0; // counts handled vault messages, see settled()
 let releasedId = null;
+let releasedInfo = null; // the page data of that request while it was open
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ra-vault-'));
 const hostEnv = (name) => ({
   ...process.env,
@@ -81,10 +82,10 @@ async function actOnVaultMessage(params) {
       // release: sealed to the right key, with the right context.
       const fake = await c.seal(c.unb64u(info.reply_key), new TextEncoder().encode('x'.repeat(40)),
         new TextEncoder().encode('secrets-vault release v1\n' + info.nonce + '\n' + info.name));
-      last = { id, ...(await pagePost(kind, id, { sealed: fake })) };
+      last = { id, ...(await pagePost(kind, id, { sealed: fake, proof: 'A'.repeat(43) })) };
+      await deny();
     } else {
-      const sealed = await c.releaseSecret(info.vault, vaultAction.password, info);
-      last = { id, ...(await pagePost(kind, id, { sealed })) };
+      last = { id, info, ...(await pagePost(kind, id, await c.releaseSecret(info.vault, vaultAction.password, info))) };
     }
   } catch (e) {
     last = { error: e, id };
@@ -255,6 +256,7 @@ test('vault run: released with the vault password, only into the command', async
   assert.equal(messages.length, before + 1);
   for (const re of [/db/, /migrate the database/, new RegExp(ME), /printf/]) assert.match(messages.at(-1), re);
   releasedId = last.id;
+  releasedInfo = last.info;
 });
 
 test('binary secrets survive vault get; vault run refuses a NUL byte', async () => {
@@ -270,18 +272,25 @@ test('binary secrets survive vault get; vault run refuses a NUL byte', async () 
 test('a released secret is delivered once; a late post changes nothing', async () => {
   const info = await pageData('release', releasedId);
   assert.equal(info.status, 'approved');
+  assert.equal(info.vault.locked, undefined, 'the locked key is only shown while a request is open');
   const again = await pagePost('release', releasedId, { sealed: { v: 1, epk: 'A'.repeat(87), iv: 'A'.repeat(16), ct: 'A'.repeat(22) } });
   assert.equal(again.status, 'approved');
 });
 
-test('a made-up release (no vault password) is rejected by the host', async () => {
+test('a made-up release (no vault password) is refused', async () => {
   vaultAction = { forge: true };
   const s0 = seq;
   const r = await run(web1, ['vault', 'get', 'db']);
   await settled(s0);
   assert.notEqual(r.code, 0);
-  assert.equal(last.status, 'approved', 'the Worker accepted the post');
-  assert.match(r.stderr, /does not match/);
+  assert.match(last.error, /wrong vault password/, 'the Worker refuses a post without the password');
+});
+
+test('a made-up release that gets past the Worker is still rejected by the host', async () => {
+  // Suppose the Worker itself accepted it: the host checks the commitment.
+  const s = JSON.parse(fs.readFileSync(vaultFile(web1, 'db')));
+  const fake = Buffer.concat([crypto.randomBytes(32), Buffer.from('other-value')]);
+  assert.notEqual(b64u(crypto.createHash('sha256').update(fake).digest()), s.commit);
 });
 
 test('wrong password: the page cannot open the vault', async () => {
@@ -326,7 +335,7 @@ test("a host cannot pass off another host's secret", async () => {
 
 test('the page refuses what the host did not sign, and hosts the vault does not trust', async () => {
   const c = await pageCrypto(`${workerURL}/vault/release/${releasedId}`);
-  const info = await pageData('release', releasedId);
+  const info = releasedInfo;
   await assert.rejects(c.releaseSecret(info.vault, PASSWORD, { ...info, reason: 'something else' }), (e) => e.badSignature);
   await assert.rejects(c.releaseSecret(info.vault, PASSWORD, { ...info, reply_key: info.vault.key }), (e) => e.badSignature);
   await assert.rejects(c.releaseSecret(info.vault, PASSWORD, { ...info, host: 'web9' }), (e) => e.untrusted);
