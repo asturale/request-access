@@ -13,7 +13,7 @@
 // All state lives in a single Durable Object (strongly consistent, unlike KV,
 // whose cross-location reads can lag by up to a minute).
 
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 const MAX_SKEW = 60; // seconds between a signed request's timestamp and now
 const NONCE_TTL = 600; // seconds a request nonce is remembered (replay protection)
 const MAX_PENDING_ENROLLMENTS = 3;
@@ -1477,7 +1477,7 @@ const VAULT_PAGE = `<!DOCTYPE html>
   <form id="form" autocomplete="on">
     <input class="user" type="text" name="username" autocomplete="username" value="secrets-vault" readonly>
     <label for="pw" id="pwlabel">Vault password</label>
-    <input id="pw" type="password" name="password" required>
+    <input id="pw" type="password" name="password" autocomplete="current-password" required>
     <div id="pw2box"><label for="pw2" id="pw2label">Repeat</label><input id="pw2" type="password" name="password2" autocomplete="new-password"></div>
     <button id="go" type="submit">OK</button>
   </form>
@@ -1672,11 +1672,9 @@ async function releaseSecret(vault, password, info) {
         $('msg').append(c);
       } else if (KIND === 'trust') {
         var r1 = await post(await trustHost(info.vault, pw, info.host, info.host_key));
-        $('pw').value = '';
         if (r1.status === 'approved') { $('form').style.display = 'none'; msg(t.trusted, 'ok'); } else closed(r1.status);
       } else {
         var rel = await releaseSecret(info.vault, pw, info);
-        $('pw').value = '';
         closed((await post(rel)).status);
       }
     } catch (e) {
@@ -1707,8 +1705,9 @@ async function releaseSecret(vault, password, info) {
       $('pw').setAttribute('minlength', '16');
       $('go').textContent = t.create;
     } else {
-      $('pw').setAttribute('autocomplete', 'current-password');
-      $('pw2box').style.display = 'none';
+      // Remove, not just hide, the repeat field: a "new-password" field in
+      // the form makes Android autofill offer to save the password again.
+      $('pw2box').remove();
       $('go').textContent = KIND === 'trust' ? t.trust_btn : t.release_btn;
     }
     if (info.status !== 'pending') return closed(info.status);
