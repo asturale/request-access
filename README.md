@@ -42,7 +42,9 @@ shell): if one of them is compromised, its keys alone are no longer enough.
   can approve.
 - **Grants are cached locally** (root-only, signature checked on every use)
   until they expire, which is what makes the time window work for both SSH
-  and `sudo`.
+  and `sudo`. A cached grant only covers the source it was approved for
+  (`PAM_RHOST`): approving an SSH login from one machine doesn't let another
+  machine in as the same user during the window.
 - **It fails closed.** No answer, a network error or a bad signature means no
   access.
 - **Configuration changes are approved on Telegram too.** The admin key
