@@ -320,11 +320,14 @@ func Check(r Request, out func(string)) Decision {
 		// window. Revoked: drop it and ask again. Server unreachable: the
 		// window still counts, as it would without reports, so an outage
 		// does not lock out someone holding a valid approval.
-		switch err := reportReuse(cfg, key, c.Grant.ID, r); {
+		err := reportReuse(cfg, key, c.Grant.ID, r)
+		switch {
+		case errors.Is(err, errRevoked):
+			dropGrant(srv, service, r.User, c.Grant.ID)
+		case !c.usable(cfg, service, r.User, r.RHost, time.Now()):
+			// Expired while the report was out.
 		case err == nil:
 			return Decision{Allowed: true, Reason: "cached grant", Cached: true}
-		case errors.Is(err, errRevoked):
-			_ = os.Remove(grantPath(service, r.User))
 		default:
 			return Decision{Allowed: true, Reason: "cached grant (reuse not reported: " + err.Error() + ")", Cached: true}
 		}
@@ -646,6 +649,15 @@ func loadGrant(srv ed25519.PublicKey, service, user string) *cachedGrant {
 		return nil
 	}
 	return &c
+}
+
+// dropGrant removes the cached grant for service and user, but only if it
+// is still the one with this id: a concurrent attempt may have replaced it
+// with a fresh approval meanwhile.
+func dropGrant(srv ed25519.PublicKey, service, user, id string) {
+	if c := loadGrant(srv, service, user); c != nil && c.Grant.ID == id {
+		_ = os.Remove(grantPath(service, user))
+	}
 }
 
 func saveGrant(service, user string, c cachedGrant) error {
