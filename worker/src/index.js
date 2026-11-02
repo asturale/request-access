@@ -19,6 +19,7 @@ const NONCE_TTL = 600; // seconds a request nonce is remembered (replay protecti
 const MAX_PENDING_ENROLLMENTS = 3;
 const VAULT_TIMEOUT = 300; // seconds a vault request stays open (unlocking a password manager takes a moment)
 const MAX_PENDING_VAULT = 10; // open vault requests per host
+const REUSE_NOTIFY_EVERY = 60; // seconds between reports of a window being used again
 
 const DEFAULT_CONFIG = {
   lang: 'en',
@@ -94,6 +95,7 @@ export class State {
 
     if (m === 'POST' && p === '/v1/access') return this.createAccess(caller, body, url);
     if (m === 'GET' && (mm = p.match(/^\/v1\/access\/([0-9a-f]{32})$/))) return this.accessStatus(caller, mm[1], url);
+    if (m === 'POST' && (mm = p.match(/^\/v1\/access\/([0-9a-f]{32})\/reused$/))) return this.accessReused(caller, mm[1], body);
     if (m === 'POST' && p === '/v1/passkey/register') return this.createRegistration(caller, body, url);
     if (m === 'GET' && (mm = p.match(/^\/v1\/passkey\/register\/([0-9a-f]{32})$/))) return this.registrationStatus(caller, mm[1], url);
     if (m === 'POST' && p === '/v1/vault/init') return this.vaultLink(caller, body, url, 'setup');
@@ -275,8 +277,11 @@ export class State {
       };
       req.grant = await this.sign(payload);
       req.status = 'approved';
+      req.grant_exp = payload.exp;
       const label = once ? t.once_note : `${t.valid_for} ${fmtDuration(window, cfg.lang)}`;
-      await this.editDecision(req, `✅ ${t.approved_by} ${req.approvals.map((a) => a.who).join(', ')} (${label})`);
+      // A window can be revoked while it lasts (see accessReused).
+      await this.editDecision(req, `✅ ${t.approved_by} ${req.approvals.map((a) => a.who).join(', ')} (${label})`, false,
+        once ? null : grantRevokeButton(req.id, t));
     }
     req.decided = now();
     await this.storage.put('req:' + req.id, req);
@@ -291,7 +296,8 @@ export class State {
   }
 
   // keepButtons: an intermediate state (some approvals still missing).
-  async editDecision(req, line, keepButtons = false) {
+  // markup: buttons to show instead (Revoke on an approved window).
+  async editDecision(req, line, keepButtons = false, markup = null) {
     if (!req.message_id) return;
     const params = {
       chat_id: req.chat || this.env.TELEGRAM_CHAT_ID,
@@ -300,7 +306,54 @@ export class State {
       parse_mode: 'HTML',
     };
     if (keepButtons && req.keyboard) params.reply_markup = { inline_keyboard: req.keyboard };
+    if (markup) params.reply_markup = markup;
     await this.telegram('editMessageText', params);
+  }
+
+  // A host lets an attempt in on a cached window and says so first. The
+  // approvers get a silent message with Revoke, at most one a minute per
+  // window (uses in between are counted). After Revoke the host drops the
+  // window and asks again.
+  async accessReused(caller, id, body) {
+    if (caller.kind !== 'host') throw new HttpError(403, 'hosts only');
+    const r = parseJson(body);
+    await this.useNonce(caller.name, r.nonce);
+    const req = await this.storage.get('req:' + id);
+    if (!req || req.host !== caller.name || req.status !== 'approved') throw new HttpError(404, 'not found');
+    if (req.revoked) return json({ status: 'revoked' });
+    const cfg = await this.config();
+    const t = texts(cfg.lang);
+    const uses = (req.reuse_pending || 0) + 1;
+    if (req.reuse_notified && now() - req.reuse_notified < REUSE_NOTIFY_EVERY) {
+      req.reuse_pending = uses;
+      await this.storage.put('req:' + id, req);
+      return json({ status: 'ok' });
+    }
+    const lines = [
+      `🔁 <b>${esc(t.title[req.service] || req.service)}</b> ${esc(t.on)} <b>${esc(req.host)}</b>: ${esc(t.window_used)}`,
+      `${esc(t.user)}: <code>${esc(req.user)}</code>`,
+    ];
+    const rhost = str(r.rhost, 128);
+    const tty = str(r.tty, 64);
+    const detail = str(r.detail, 256);
+    if (rhost) lines.push(`${esc(t.from)}: <code>${esc(rhost)}</code>`);
+    if (tty) lines.push(`TTY: <code>${esc(tty)}</code>`);
+    if (detail) lines.push(`<code>${esc(detail)}</code>`);
+    if (uses > 1) lines.push(`${esc(t.uses_since)}: ${uses}`);
+    await this.telegram('sendMessage', {
+      chat_id: req.chat || this.env.TELEGRAM_CHAT_ID,
+      text: lines.join('\n'),
+      parse_mode: 'HTML',
+      disable_notification: true,
+      reply_markup: grantRevokeButton(id, t),
+    });
+    // Re-read: a Revoke that landed meanwhile must win.
+    const cur = await this.storage.get('req:' + id);
+    if (!cur || cur.revoked) return json({ status: 'revoked' });
+    cur.reuse_notified = now();
+    cur.reuse_pending = 0;
+    await this.storage.put('req:' + id, cur);
+    return json({ status: 'ok' });
   }
 
   // ---------------------------------------------------------------- passkeys
@@ -892,7 +945,7 @@ export class State {
       await this.telegram('answerCallbackQuery', { callback_query_id: cq.id, text: t.not_allowed });
       return json({ ok: true });
     };
-    const m = /^([rexpvsh]):([0-9a-f]{32}):([aod])$/.exec(cq.data || '');
+    const m = /^([rexpvshg]):([0-9a-f]{32}):([aod])$/.exec(cq.data || '');
     let result = 'unknown';
     if (m) {
       const [, kind, id, choice] = m;
@@ -903,6 +956,19 @@ export class State {
         const allowed = req ? req.approvers || defaultApprovers(this.env) : [];
         if (!allowed.includes(fromId)) return denyTap();
         result = await this.decideAccess(req, choice, cq.from);
+      } else if (kind === 'g') {
+        // Revoke an approved window: the route's approvers, like approving.
+        const req = await this.storage.get('req:' + id);
+        const allowed = req ? req.approvers || defaultApprovers(this.env) : [];
+        if (!allowed.includes(fromId)) return denyTap();
+        if (req.status === 'approved' && choice === 'd') {
+          if (!req.revoked) {
+            req.revoked = now();
+            await this.storage.put('req:' + id, req);
+            await this.editDecision(req, `🚫 ${t.window_revoked_by} ${who(cq.from)}`);
+          }
+          result = 'revoked';
+        }
       } else if (!defaultApprovers(this.env).includes(fromId)) {
         return denyTap();
       } else if (kind === 'p') {
@@ -1003,7 +1069,8 @@ export class State {
           }
         } else if (v.status === 'pending') {
           next = next === null ? v.expires : Math.min(next, v.expires);
-        } else if (t - v.created > 86400) {
+        } else if (t - v.created > 86400 && !(v.grant_exp > t)) {
+          // An approved window is kept while it lasts, so it can be revoked.
           await this.storage.delete(k);
         }
       }
@@ -1236,6 +1303,10 @@ function holdText(h, t) {
   return p ? `${fmtDuration(p.idle, t.lang)} ${t.hold_idle}, max ${fmtDuration(p.max, t.lang)}` : '';
 }
 
+function grantRevokeButton(id, t) {
+  return { inline_keyboard: [[{ text: `🚫 ${t.window_revoke}`, callback_data: `g:${id}:d` }]] };
+}
+
 function revokeButton(id, t) {
   return { inline_keyboard: [[{ text: `🚫 ${t.hold_revoke}`, callback_data: `h:${id}:d` }]] };
 }
@@ -1266,6 +1337,7 @@ function texts(lang) {
     vault_title: 'Secret', reason: 'Reason', vault_release: 'Open to release', vault_released: 'Released',
     lang: 'en', hold_ask: 'Asks to hold it', hold: 'held', hold_idle: 'between uses', hold_revoke: 'Revoke hold', hold_revoked_by: 'Hold revoked by',
     vault_reused: 'held secret used again',
+    window_used: 'approved window used again', uses_since: 'Uses since the last message', window_revoke: 'Revoke window', window_revoked_by: 'Window revoked by',
     status: { revoked: 'Hold revoked', approved: 'Approved', denied: 'Denied', expired: 'Already expired', pending: 'Noted, waiting for more approvals', unknown: 'Unknown request', passkey_required: 'This server needs your passkey: use the 🔑 button' },
   };
   if (lang !== 'nl') return en;
@@ -1286,6 +1358,7 @@ function texts(lang) {
     vault_title: 'Geheim', reason: 'Reden', vault_release: 'Openen om vrij te geven', vault_released: 'Vrijgegeven',
     lang: 'nl', hold_ask: 'Vraagt om vast te houden', hold: 'vastgehouden', hold_idle: 'tussen gebruik', hold_revoke: 'Intrekken', hold_revoked_by: 'Ingetrokken door',
     vault_reused: 'vastgehouden geheim opnieuw gebruikt',
+    window_used: 'goedgekeurd venster opnieuw gebruikt', uses_since: 'Keer gebruikt sinds vorige melding', window_revoke: 'Venster intrekken', window_revoked_by: 'Venster ingetrokken door',
     status: { revoked: 'Ingetrokken', approved: 'Goedgekeurd', denied: 'Geweigerd', expired: 'Al verlopen', pending: 'Genoteerd, wacht op meer akkoorden', unknown: 'Onbekend verzoek', passkey_required: 'Deze server vraagt je passkey: gebruik de 🔑-knop' },
   };
 }

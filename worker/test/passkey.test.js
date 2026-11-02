@@ -85,6 +85,10 @@ before(async () => {
         messages.push({ text: params.text, buttons: kb });
         const link = kb.find((b) => b.url);
         if (link && onLink) setTimeout(() => onLink(link.url), 300);
+        // Reports of a window used again (only Revoke) are left alone.
+        if (kb.length && kb.every((b) => (b.callback_data || '').startsWith('g:'))) {
+          return res.end(JSON.stringify({ ok: true, result: { message_id: messages.length } }));
+        }
         const cb = nextTap && kb.find((b) => b.callback_data && b.callback_data.endsWith(':' + nextTap));
         const data = cb ? cb.callback_data : nextTap && kb.find((b) => b.callback_data) &&
           kb.find((b) => b.callback_data).callback_data.replace(/:[aod]$/, ':' + nextTap);
@@ -185,7 +189,8 @@ test('approve with the passkey, then served from the cache', async () => {
   const before = messages.length;
   r = await sudo('alice');
   assert.equal(r.code, 0);
-  assert.equal(messages.length, before, 'cached');
+  assert.equal(messages.length, before + 1, 'cached, with one silent report');
+  assert.ok(messages.at(-1).buttons.every((b) => b.callback_data.startsWith('g:')), 'the report only offers Revoke');
   r = await run(['status']);
   assert.match(r.stdout, /sudo alice \(valid for .*passkey\)/);
 });

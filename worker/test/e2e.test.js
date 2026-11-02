@@ -21,6 +21,7 @@ const SECRET = 'e2e-webhook-secret';
 let mf, tg, workerURL;
 let nextTap = 'a'; // what the fake approver taps next
 const messages = [];
+const sent = []; // every sendMessage, with its parameters
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ra-e2e-'));
 const env = {
   ...process.env,
@@ -42,7 +43,11 @@ before(async () => {
       if (method === 'sendMessage') {
         const kb = params.reply_markup && params.reply_markup.inline_keyboard;
         messages.push(params.text + (kb ? '\n[' + kb.flat().map((b) => b.text).join('] [') + ']' : ''));
-        if (kb && nextTap) {
+        sent.push(params);
+        // Reports of a window being used again only offer Revoke; the fake
+        // approver leaves those alone (the tests tap them on purpose).
+        const report = kb && kb.flat().every((b) => (b.callback_data || '').startsWith('g:'));
+        if (kb && nextTap && !report) {
           const data = kb.flat().map((b) => b.callback_data).find((d) => d.endsWith(':' + nextTap)) ||
             kb.flat()[0].callback_data.replace(/:[aod]$/, ':' + nextTap);
           setTimeout(() => tap(data), 300);
@@ -114,7 +119,10 @@ test('enroll waits for approval and writes the host config', async () => {
   assert.match(messages.at(-1), /web1/);
 });
 
-test('ssh login: approved, then served from the cache without a new message', async () => {
+const grantFile = (service, user) => path.join(env.REQUEST_ACCESS_STATE_DIR, 'grants', `${service}__${user}.json`);
+const grantId = (service, user) => JSON.parse(Buffer.from(JSON.parse(fs.readFileSync(grantFile(service, user))).payload, 'base64url')).id;
+
+test('ssh login: approved, then served from the cache with a silent report', async () => {
   nextTap = 'a';
   const before = messages.length;
   let r = await pam('sshd', 'alice');
@@ -123,7 +131,55 @@ test('ssh login: approved, then served from the cache without a new message', as
   assert.match(messages.at(-1), /alice/);
   r = await pam('sshd', 'alice');
   assert.equal(r.code, 0);
-  assert.equal(messages.length, before + 1, 'second login used the cached grant');
+  assert.equal(messages.length, before + 2, 'second login used the cached grant and reported it');
+  const report = sent.at(-1);
+  assert.equal(report.disable_notification, true, 'the report is silent');
+  assert.match(report.text, /approved window used again/);
+  assert.match(report.text, /10\.1\.2\.3/);
+  assert.deepEqual(report.reply_markup.inline_keyboard.flat().map((b) => b.callback_data), [`g:${grantId('ssh', 'alice')}:d`]);
+  // Within the minute: no new message, the use is counted.
+  r = await pam('sshd', 'alice');
+  assert.equal(r.code, 0);
+  assert.equal(messages.length, before + 2, 'at most one report a minute');
+});
+
+test('a revoked window is dropped and asked for again', async () => {
+  const id = grantId('ssh', 'alice');
+  await tap(`g:${id}:d`);
+  nextTap = 'd';
+  const before = messages.length;
+  const r = await pam('sshd', 'alice');
+  assert.notEqual(r.code, 0, 'revoked: asked again, and denied');
+  assert.equal(messages.length, before + 1);
+  assert.match(messages.at(-1), /alice/);
+  assert.ok(!fs.existsSync(grantFile('ssh', 'alice')), 'the window was dropped');
+  // Approve again, for the tests below.
+  nextTap = 'a';
+  assert.equal((await pam('sshd', 'alice')).code, 0);
+});
+
+test('only an approver can revoke a window', async () => {
+  const id = grantId('ssh', 'alice');
+  await fetch(workerURL + '/telegram/webhook', {
+    method: 'POST',
+    headers: { 'X-Telegram-Bot-Api-Secret-Token': SECRET, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ callback_query: { id: 'cq', from: { id: 999, username: 'stranger' }, data: `g:${id}:d` } }),
+  });
+  const before = messages.length;
+  assert.equal((await pam('sshd', 'alice')).code, 0, 'the window still counts');
+  assert.ok(messages.length <= before + 1, 'no new approval asked');
+  assert.ok(!messages.slice(before).some((m) => /Allow/.test(m)));
+});
+
+test('server unreachable: a cached window still counts', async () => {
+  const etc = path.join(tmp, 'etc-offline');
+  fs.cpSync(env.REQUEST_ACCESS_CONFIG_DIR, etc, { recursive: true });
+  const f = path.join(etc, 'config.json');
+  fs.writeFileSync(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f)), url: 'http://127.0.0.1:9' }));
+  const r = await pam('sshd', 'alice', { REQUEST_ACCESS_CONFIG_DIR: etc });
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const n = await pam('sshd', 'nobody-cached', { REQUEST_ACCESS_CONFIG_DIR: etc });
+  assert.notEqual(n.code, 0, 'without a window it still fails closed');
 });
 
 test('a grant for one user or service does not cover another', async () => {

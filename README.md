@@ -45,8 +45,14 @@ shell): if one of them is compromised, its keys alone are no longer enough.
   and `sudo`. A cached grant only covers the source it was approved for
   (`PAM_RHOST`): approving an SSH login from one machine doesn't let another
   machine in as the same user during the window.
+- **Every use of a window is reported.** Before a cached grant lets someone
+  in, the server tells the Worker, and you get a silent Telegram message
+  (at most one a minute per window) with **Revoke**; the approval message
+  offers it too. After Revoke the server drops the window and asks again.
+  If the Worker cannot be reached within 3 seconds, the window still counts,
+  so an outage does not lock out an approval you already gave.
 - **It fails closed.** No answer, a network error or a bad signature means no
-  access.
+  access (a still-valid window aside, see above).
 - **Configuration changes are approved on Telegram too.** The admin key
   alone cannot widen windows, swap a host's key or remove a host.
 
