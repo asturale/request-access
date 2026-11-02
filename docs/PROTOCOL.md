@@ -31,6 +31,7 @@ remembered for 10 minutes; a reused nonce is rejected with 409.
 | GET    | `/v1/enroll/<id>?wait=N`   | none   | `{status}`: `pending`, `approved`, `denied`, `expired` |
 | POST   | `/v1/access`               | host   | `{service, user, rhost?, tty?, detail?, nonce}` → `{id, expires, window}` |
 | GET    | `/v1/access/<id>?wait=N`   | host   | `{status, grant?}`; only the requesting host can read it |
+| POST   | `/v1/access/<id>/reused`   | host   | `{rhost?, tty?, detail?, nonce}` → `{status: ok\|revoked}`; a cached window is used again (silent message with Revoke, at most one a minute) |
 | GET    | `/v1/admin/state`          | admin  | `{version, config, hosts}` |
 | POST   | `/v1/admin/actions`        | admin  | `{action: "set_config", config, nonce}` or `{action: "remove_host", name, nonce}` → `{id}` |
 | GET    | `/v1/admin/actions/<id>`   | admin  | `{status}` |

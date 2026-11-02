@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -315,7 +316,18 @@ func Check(r Request, out func(string)) Decision {
 	required := pk != nil && pk.Required
 	now := time.Now()
 	if c := loadGrant(srv, service, r.User); c != nil && c.usable(cfg, service, r.User, r.RHost, now) {
-		return Decision{Allowed: true, Reason: "cached grant", Cached: true}
+		// Report the reuse first, so the approver sees it and can revoke the
+		// window. Revoked: drop it and ask again. Server unreachable: the
+		// window still counts, as it would without reports, so an outage
+		// does not lock out someone holding a valid approval.
+		switch err := reportReuse(cfg, key, c.Grant.ID, r); {
+		case err == nil:
+			return Decision{Allowed: true, Reason: "cached grant", Cached: true}
+		case errors.Is(err, errRevoked):
+			_ = os.Remove(grantPath(service, r.User))
+		default:
+			return Decision{Allowed: true, Reason: "cached grant (reuse not reported: " + err.Error() + ")", Cached: true}
+		}
 	}
 	if required && len(pk.Credentials) == 0 {
 		return Decision{Reason: "passkey required but none registered"}
@@ -563,6 +575,32 @@ func RequirePasskey(on bool) error {
 }
 
 // ---------------------------------------------------------------- grant cache
+
+var errRevoked = errors.New("window revoked")
+
+// reuseTimeout bounds how long a cached login or sudo waits for the report.
+var reuseTimeout = 3 * time.Second
+
+// reportReuse tells the server a cached window is used again. errRevoked
+// if the approver revoked it; any other error means the report did not
+// get through.
+func reportReuse(cfg *Config, key ed25519.PrivateKey, id string, r Request) error {
+	client := cfg.Client(key)
+	client.HTTP = &http.Client{Timeout: reuseTimeout}
+	var out struct {
+		Status string `json:"status"`
+	}
+	err := client.Do("POST", "/v1/access/"+id+"/reused", map[string]any{
+		"rhost": r.RHost, "tty": r.TTY, "detail": r.Detail, "nonce": proto.Nonce(),
+	}, &out)
+	if err != nil {
+		return err
+	}
+	if out.Status == "revoked" {
+		return errRevoked
+	}
+	return nil
+}
 
 var safeRE = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
