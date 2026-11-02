@@ -177,10 +177,14 @@ func (a *Agent) handle(c *net.UnixConn) {
 	if req.Hold > 0 {
 		if scope := sessionScope(cred.Pid); scope != "" {
 			key = holdKey{uid: cred.Uid, name: s.Name, commit: s.Commit, scope: scope}
-			if value, env, id, ok := a.holds.get(key, time.Now()); ok {
+			if value, env, id, gen, ok := a.holds.get(key, time.Now()); ok {
 				// Every reuse is reported; if the approver revoked the hold,
-				// or the report fails, ask again instead.
+				// or the report fails, ask again instead. The hold may also
+				// have been forgotten or ended while the report was out.
 				err := Reused(id, reason, detail)
+				if err == nil && !a.holds.still(key, gen, time.Now()) {
+					err = errors.New("dropped meanwhile")
+				}
 				if err == nil {
 					a.Logf("vault: %s / %q: served from hold", u.Username, s.Name)
 					reply(AgentAnswer{Secret: base64.StdEncoding.EncodeToString(value), Env: env, Held: "reused"})

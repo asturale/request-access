@@ -613,8 +613,12 @@ export class State {
       disable_notification: true,
       reply_markup: revokeButton(id, t),
     });
-    req.reuses = (req.reuses || 0) + 1;
-    await this.storage.put('vreq:' + id, req);
+    // Re-read: a Revoke may have landed while the message was sent, and
+    // must neither be overwritten nor be answered with "held".
+    const cur = await this.storage.get('vreq:' + id);
+    if (!cur || cur.revoked) return json({ status: 'revoked' });
+    cur.reuses = (cur.reuses || 0) + 1;
+    await this.storage.put('vreq:' + id, cur);
     return json({ status: 'held' });
   }
 

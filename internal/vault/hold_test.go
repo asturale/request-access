@@ -53,11 +53,11 @@ func TestHolds(t *testing.T) {
 	secret := []byte("tok")
 	hs.put(k, &heldSecret{value: secret, env: "GH_TOKEN", request: "r1", idle: 30 * time.Minute, until: now.Add(4 * time.Hour), lastUsed: now})
 
-	if v, env, id, ok := hs.get(k, now.Add(20*time.Minute)); !ok || string(v) != "tok" || env != "GH_TOKEN" || id != "r1" {
+	if v, env, id, _, ok := hs.get(k, now.Add(20*time.Minute)); !ok || string(v) != "tok" || env != "GH_TOKEN" || id != "r1" {
 		t.Fatalf("get: %q %q %q %v", v, env, id, ok)
 	}
 	// Use moved the idle window on.
-	if _, _, _, ok := hs.get(k, now.Add(45*time.Minute)); !ok {
+	if _, _, _, _, ok := hs.get(k, now.Add(45*time.Minute)); !ok {
 		t.Fatal("hold should still be live 25 min after last use")
 	}
 	for _, other := range []holdKey{
@@ -66,12 +66,12 @@ func TestHolds(t *testing.T) {
 		{uid: 1000, name: "gh", commit: "c2", scope: "42@7"},
 		{uid: 1000, name: "gh", commit: "c1", scope: "43@7"},
 	} {
-		if _, _, _, ok := hs.get(other, now); ok {
+		if _, _, _, _, ok := hs.get(other, now); ok {
 			t.Fatalf("hold served to %+v", other)
 		}
 	}
 	// Idle too long: gone, and wiped.
-	if _, _, _, ok := hs.get(k, now.Add(45*time.Minute+31*time.Minute)); ok {
+	if _, _, _, _, ok := hs.get(k, now.Add(45*time.Minute+31*time.Minute)); ok {
 		t.Fatal("idle hold served")
 	}
 	if !bytes.Equal(secret, make([]byte, 3)) {
@@ -81,13 +81,25 @@ func TestHolds(t *testing.T) {
 	// Total limit, however often it is used.
 	hs.put(k, &heldSecret{value: []byte("x"), idle: time.Hour, until: now.Add(90 * time.Minute), lastUsed: now})
 	for m := 50; m <= 100; m += 50 {
-		_, _, _, ok := hs.get(k, now.Add(time.Duration(m)*time.Minute))
+		_, _, _, _, ok := hs.get(k, now.Add(time.Duration(m)*time.Minute))
 		if ok != (m < 90) {
 			t.Fatalf("at %d min: ok=%v", m, ok)
 		}
 	}
 
 	hs.put(k, &heldSecret{value: []byte("x"), idle: time.Hour, until: now.Add(time.Hour), lastUsed: now})
+	_, _, _, gen, _ := hs.get(k, now)
+	if !hs.still(k, gen, now) {
+		t.Fatal("copy should still be servable")
+	}
+	hs.forget(1000, "gh")
+	if hs.still(k, gen, now) {
+		t.Fatal("copy of a forgotten hold is servable")
+	}
+	hs.put(k, &heldSecret{value: []byte("x"), idle: time.Hour, until: now.Add(time.Hour), lastUsed: now})
+	if hs.still(k, gen, now) {
+		t.Fatal("copy of a replaced hold is servable")
+	}
 	hs.put(holdKey{uid: 1000, name: "cf"}, &heldSecret{value: []byte("y"), idle: time.Hour, until: now.Add(time.Hour), lastUsed: now})
 	hs.put(holdKey{uid: 1001, name: "gh"}, &heldSecret{value: []byte("z"), idle: time.Hour, until: now.Add(time.Hour), lastUsed: now})
 	if n := hs.forget(1000, "gh"); n != 1 {

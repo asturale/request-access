@@ -27,6 +27,7 @@ type heldSecret struct {
 	idle     time.Duration
 	until    time.Time // the hold ends here, however often it is used
 	lastUsed time.Time
+	gen      uint64 // set by put; a copy handed out is only served if it still matches
 }
 
 func (h *heldSecret) live(now time.Time) bool {
@@ -43,24 +44,35 @@ type holdKey struct {
 }
 
 type holds struct {
-	mu sync.Mutex
-	m  map[holdKey]*heldSecret
+	mu  sync.Mutex
+	m   map[holdKey]*heldSecret
+	gen uint64
 }
 
-// get returns a copy of a live held secret and marks it used.
-func (hs *holds) get(k holdKey, now time.Time) (value []byte, env, request string, ok bool) {
+// get returns a copy of a live held secret and marks it used. The copy is
+// for after the reuse is reported: serve it only if still(k, gen) says so.
+func (hs *holds) get(k holdKey, now time.Time) (value []byte, env, request string, gen uint64, ok bool) {
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
 	h := hs.m[k]
 	if h == nil {
-		return nil, "", "", false
+		return nil, "", "", 0, false
 	}
 	if !h.live(now) {
 		hs.dropLocked(k)
-		return nil, "", "", false
+		return nil, "", "", 0, false
 	}
 	h.lastUsed = now
-	return append([]byte{}, h.value...), h.env, h.request, true
+	return append([]byte{}, h.value...), h.env, h.request, h.gen, true
+}
+
+// still says whether the hold a copy came from is still there and live:
+// not forgotten, replaced or ended meanwhile.
+func (hs *holds) still(k holdKey, gen uint64, now time.Time) bool {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	h := hs.m[k]
+	return h != nil && h.gen == gen && now.Before(h.until)
 }
 
 func (hs *holds) put(k holdKey, h *heldSecret) {
@@ -70,6 +82,8 @@ func (hs *holds) put(k holdKey, h *heldSecret) {
 		hs.m = map[holdKey]*heldSecret{}
 	}
 	hs.dropLocked(k)
+	hs.gen++
+	h.gen = hs.gen
 	hs.m[k] = h
 }
 
