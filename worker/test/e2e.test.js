@@ -171,6 +171,35 @@ test('only an approver can revoke a window', async () => {
   assert.ok(!messages.slice(before).some((m) => /Allow/.test(m)));
 });
 
+test('SSH + sudo: one tap approves both, each with its own window', async () => {
+  nextTap = 'b';
+  let before = messages.length;
+  let r = await pam('sshd', 'henk');
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.match(messages[before], /SSH \+ sudo/, 'the SSH request offers it');
+  nextTap = 'd';
+  before = messages.length;
+  r = await pam('sudo', 'root', { PAM_RUSER: 'henk', PAM_RHOST: '' });
+  assert.equal(r.code, 0, 'sudo came with the SSH approval: ' + r.stdout);
+  assert.ok(!messages.slice(before).some((m) => /Allow/.test(m)), 'no new approval asked');
+  assert.ok(fs.existsSync(grantFile('sudo', 'henk')));
+  // (sudo has no remote host, as on a real server.)
+  // Both windows hang off the same request: one Revoke ends both.
+  await tap(`g:${grantId('sudo', 'henk')}:d`);
+  assert.notEqual((await pam('sudo', 'root', { PAM_RUSER: 'henk', PAM_RHOST: '' })).code, 0, 'revoked: asked again, denied');
+  assert.notEqual((await pam('sshd', 'henk')).code, 0, 'the SSH window is revoked as well');
+});
+
+test('plain Allow on SSH does not cover sudo; sudo requests offer no SSH + sudo', async () => {
+  nextTap = 'a';
+  assert.equal((await pam('sshd', 'ivo')).code, 0);
+  nextTap = 'd';
+  const before = messages.length;
+  assert.notEqual((await pam('sudo', 'root', { PAM_RUSER: 'ivo', PAM_RHOST: '' })).code, 0);
+  assert.equal(messages.length, before + 1);
+  assert.doesNotMatch(messages.at(-1), /SSH \+ sudo/);
+});
+
 test('server unreachable: a cached window still counts', async () => {
   const etc = path.join(tmp, 'etc-offline');
   fs.cpSync(env.REQUEST_ACCESS_CONFIG_DIR, etc, { recursive: true });

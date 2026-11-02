@@ -45,6 +45,10 @@ shell): if one of them is compromised, its keys alone are no longer enough.
   and `sudo`. A cached grant only covers the source it was approved for
   (`PAM_RHOST`): approving an SSH login from one machine doesn't let another
   machine in as the same user during the window.
+- **SSH and sudo in one approval.** An SSH request also offers "SSH +
+  sudo": one tap (or one passkey signature, over that choice) approves the
+  login and a sudo window for the same user, each with its own duration.
+  One Revoke ends both.
 - **Every use of a window is reported.** Before a cached grant lets someone
   in, the server tells the Worker, and you get a silent Telegram message
   (at most one a minute per window) with **Revoke**; the approval message

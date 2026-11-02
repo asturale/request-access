@@ -343,17 +343,27 @@ func Check(r Request, out func(string)) Decision {
 		"service": service, "user": r.User, "rhost": r.RHost, "tty": r.TTY,
 		"detail": r.Detail, "nonce": nonce,
 	}
-	var chWindow, chOnce string
+	if service == "ssh" {
+		body["offer_sudo"] = true // this host keeps a sudo grant approved with SSH
+	}
+	var chWindow, chOnce, chBoth string
 	if pk.active() {
 		chWindow = passkey.RequestChallenge(cfg.Name, service, r.User, nonce, "window")
 		chOnce = passkey.RequestChallenge(cfg.Name, service, r.User, nonce, "once")
+		challenges := map[string]string{"window": chWindow, "once": chOnce}
+		// An SSH login may be approved together with sudo for the same
+		// user; that choice is signed like the others.
+		if service == "ssh" {
+			chBoth = passkey.RequestChallenge(cfg.Name, service, r.User, nonce, "window+sudo")
+			challenges["both"] = chBoth
+		}
 		ids := make([]string, 0, len(pk.Credentials))
 		for _, c := range pk.Credentials {
 			ids = append(ids, c.ID)
 		}
 		body["passkey"] = map[string]any{
 			"rp_id":       pk.ID,
-			"challenges":  map[string]string{"window": chWindow, "once": chOnce},
+			"challenges":  challenges,
 			"credentials": ids,
 			"required":    required,
 		}
@@ -380,6 +390,7 @@ func Check(r Request, out func(string)) Decision {
 		var st struct {
 			Status  string             `json:"status"`
 			Grant   *proto.SignedGrant `json:"grant"`
+			Sudo    *proto.SignedGrant `json:"grant_sudo"` // with "SSH + sudo"
 			Passkey *passkey.Assertion `json:"passkey"`
 		}
 		if err := client.Do("GET", "/v1/access/"+created.ID+"?wait=20", nil, &st); err != nil {
@@ -404,15 +415,24 @@ func Check(r Request, out func(string)) Decision {
 			}
 			c := cachedGrant{SignedGrant: *st.Grant, RHost: r.RHost}
 			once := g.Once
+			// withSudo: the approver chose "SSH + sudo". With a passkey,
+			// only if that is what it signed; without, the server's word
+			// is all there is anyway, as for any grant.
+			withSudo := service == "ssh" && st.Sudo != nil
 			reason := "approved"
 			if st.Passkey != nil && pk.active() {
-				signed, cred, err := passkey.VerifyAssertion(*st.Passkey, pk.RP, pk.Credentials, []string{chWindow, chOnce})
+				allowed := []string{chWindow, chOnce}
+				if chBoth != "" {
+					allowed = append(allowed, chBoth)
+				}
+				signed, cred, err := passkey.VerifyAssertion(*st.Passkey, pk.RP, pk.Credentials, allowed)
 				if err != nil {
 					return Decision{Reason: err.Error()}
 				}
 				// The choice is part of what the passkey signed; the
 				// window is this host's, not the server's.
 				once = once || signed == chOnce
+				withSudo = withSudo && signed == chBoth
 				c.Passkey = true
 				c.Credential = cred.ID
 				c.Until = started.Unix() + pk.window()
@@ -422,6 +442,14 @@ func Check(r Request, out func(string)) Decision {
 			}
 			if !once {
 				_ = saveGrant(service, r.User, c)
+				if withSudo {
+					if sg, err := st.Sudo.Verify(srv); err == nil && sg.Nonce == nonce && sg.ID == created.ID &&
+						sg.Service == "sudo" && !sg.Once && sg.Allows(cfg.Name, "sudo", r.User, time.Now()) {
+						// sudo is local: no source to bind it to.
+						_ = saveGrant("sudo", r.User, cachedGrant{SignedGrant: *st.Sudo, Passkey: c.Passkey, Credential: c.Credential, Until: c.Until})
+						reason += ", with sudo"
+					}
+				}
 			}
 			return Decision{Allowed: true, Reason: reason}
 		default:

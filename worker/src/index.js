@@ -174,6 +174,9 @@ export class State {
       created: now(),
       expires: now() + cfg.request_timeout,
       window: windowFor(cfg, caller.name, service),
+      // SSH logins can be approved together with sudo for the same user.
+      // (only hosts that know how to keep the sudo grant ask for it).
+      window_sudo: service === 'ssh' && r.offer_sudo === true ? windowFor(cfg, caller.name, 'sudo') : 0,
       status: 'pending',
       ...routeFor(cfg, this.env, caller.name, user),
       approvals: [],
@@ -200,6 +203,7 @@ export class State {
         { text: `✅ ${t.allow} ${fmtDuration(req.window, cfg.lang)}`, callback_data: `r:${id}:a` },
         { text: `☑️ ${t.once}`, callback_data: `r:${id}:o` },
       ]);
+      if (req.window_sudo) keyboard.push([{ text: `✅ ${t.with_sudo} (${fmtDuration(req.window, cfg.lang)} / sudo ${fmtDuration(req.window_sudo, cfg.lang)})`, callback_data: `r:${id}:b` }]);
     }
     keyboard.push([{ text: `❌ ${t.deny}`, callback_data: `r:${id}:d` }]);
     const sent = await this.telegram('sendMessage', {
@@ -226,6 +230,7 @@ export class State {
       if (req.status !== 'pending' || Date.now() >= deadline) {
         const out = { status: req.status };
         if (req.status === 'approved') out.grant = req.grant;
+        if (req.status === 'approved' && req.grant_sudo) out.grant_sudo = req.grant_sudo;
         if (req.status === 'approved' && req.assertion) out.passkey = req.assertion;
         return json(out);
       }
@@ -252,7 +257,7 @@ export class State {
       // With several approvers required, collect distinct approvals first.
       // "Just this once" from any of them makes the grant a one-off.
       const id = String(from && from.id);
-      if (!req.approvals.some((a) => a.id === id)) req.approvals.push({ id, who: who(from), once: choice === 'o' });
+      if (!req.approvals.some((a) => a.id === id)) req.approvals.push({ id, who: who(from), once: choice === 'o', sudo: choice === 'b' });
       if (assertion) req.assertion = assertion;
       // A passkey approval is complete on its own: the host checks one
       // signature and does not count Telegram taps.
@@ -278,7 +283,17 @@ export class State {
       req.grant = await this.sign(payload);
       req.status = 'approved';
       req.grant_exp = payload.exp;
-      const label = once ? t.once_note : `${t.valid_for} ${fmtDuration(window, cfg.lang)}`;
+      // "SSH + sudo": only if every approval asked for it (or the passkey
+      // signed it; the host checks that signature itself).
+      const withSudo = !once && !!req.window_sudo &&
+        (assertion ? choice === 'b' : req.approvals.every((a) => a.sudo));
+      if (withSudo) {
+        const sudoExp = now() + req.window_sudo;
+        req.grant_sudo = await this.sign({ ...payload, service: 'sudo', exp: sudoExp });
+        req.grant_exp = Math.max(req.grant_exp, sudoExp);
+      }
+      const label = (once ? t.once_note : `${t.valid_for} ${fmtDuration(window, cfg.lang)}`) +
+        (withSudo ? `, ${t.with_sudo_note} ${fmtDuration(req.window_sudo, cfg.lang)}` : '');
       // A window can be revoked while it lasts (see accessReused).
       await this.editDecision(req, `✅ ${t.approved_by} ${req.approvals.map((a) => a.who).join(', ')} (${label})`, false,
         once ? null : grantRevokeButton(req.id, t));
@@ -368,7 +383,7 @@ export class State {
       status: req.status === 'pending' && now() >= req.expires ? 'expired' : req.status,
       host: req.host, service: req.service, user: req.user,
       rhost: req.rhost, tty: req.tty, detail: req.detail,
-      window: req.window, expires: req.expires,
+      window: req.window, window_sudo: req.passkey.challenges.both ? req.window_sudo || 0 : 0, expires: req.expires,
       rp_id: req.passkey.rp_id,
       challenges: req.passkey.challenges,
       credentials: req.passkey.credentials,
@@ -379,8 +394,8 @@ export class State {
     const req = await this.storage.get('req:' + id);
     if (!req || !req.passkey) throw new HttpError(404, 'not found');
     const r = parseJson(body);
-    const choice = { window: 'a', once: 'o' }[r.choice];
-    if (!choice) throw new HttpError(400, 'bad choice');
+    const choice = { window: 'a', once: 'o', both: 'b' }[r.choice];
+    if (!choice || !req.passkey.challenges[r.choice]) throw new HttpError(400, 'bad choice');
     const a = parseAssertion(r.assertion);
     // A sanity check so a stray post cannot close the request; the real
     // verification (signature, key, site, user verification) is the host's.
@@ -945,10 +960,12 @@ export class State {
       await this.telegram('answerCallbackQuery', { callback_query_id: cq.id, text: t.not_allowed });
       return json({ ok: true });
     };
-    const m = /^([rexpvshg]):([0-9a-f]{32}):([aod])$/.exec(cq.data || '');
+    const m = /^([rexpvshg]):([0-9a-f]{32}):([aodb])$/.exec(cq.data || '');
     let result = 'unknown';
     if (m) {
       const [, kind, id, choice] = m;
+      // "SSH + sudo" only exists on access requests.
+      if (choice === 'b' && kind !== 'r') return denyTap();
       // Access requests are approved by their route's approvers; enrolling
       // hosts and admin changes only by the default approvers.
       if (kind === 'r') {
@@ -1216,9 +1233,13 @@ function parsePasskeyRequest(p, url) {
   if (p.rp_id !== url.hostname) throw new HttpError(400, "passkey rp_id must be this server's host name");
   const c = p.challenges || {};
   if (!isB64u(c.window, 43, 86) || !isB64u(c.once, 43, 86) || c.window === c.once) throw new HttpError(400, 'bad passkey challenges');
+  // "both": SSH together with sudo, offered by hosts for SSH logins.
+  if (c.both !== undefined && (!isB64u(c.both, 43, 86) || c.both === c.window || c.both === c.once)) throw new HttpError(400, 'bad passkey challenges');
   const credentials = credentialIds(p.credentials);
   if (!credentials.length) throw new HttpError(400, 'no passkeys');
-  return { rp_id: p.rp_id, challenges: { window: c.window, once: c.once }, credentials, required: p.required === true };
+  const challenges = { window: c.window, once: c.once };
+  if (c.both !== undefined) challenges.both = c.both;
+  return { rp_id: p.rp_id, challenges, credentials, required: p.required === true };
 }
 
 // Vault shapes: a raw P-256 public key (65 bytes), the password-locked
@@ -1323,7 +1344,7 @@ function texts(lang) {
   const en = {
     title: { ssh: 'SSH login', sudo: 'sudo' },
     on: 'on', user: 'User', from: 'From', server: 'Server', needs: 'Approvals needed:',
-    allow: 'Allow', once: 'Just this once', deny: 'Deny',
+    allow: 'Allow', once: 'Just this once', deny: 'Deny', with_sudo: 'SSH + sudo', with_sudo_note: 'with sudo',
     approved_by: 'Approved by', denied_by: 'Denied by', valid_for: 'valid for', once_note: 'this once',
     expired: 'Expired, no answer in time', not_allowed: 'You are not an approver.',
     enroll: 'New server wants to enroll', reenroll: 'Server wants to replace its key', fingerprint: 'Key fingerprint',
@@ -1344,7 +1365,7 @@ function texts(lang) {
   return {
     title: { ssh: 'SSH-login', sudo: 'sudo' },
     on: 'op', user: 'Gebruiker', from: 'Vanaf', server: 'Server', needs: 'Akkoorden nodig:',
-    allow: 'Toestaan', once: 'Alleen deze keer', deny: 'Weigeren',
+    allow: 'Toestaan', once: 'Alleen deze keer', deny: 'Weigeren', with_sudo: 'SSH + sudo', with_sudo_note: 'met sudo',
     approved_by: 'Goedgekeurd door', denied_by: 'Geweigerd door', valid_for: 'geldig', once_note: 'alleen deze keer',
     expired: 'Verlopen, niet op tijd beantwoord', not_allowed: 'Je mag dit niet goedkeuren.',
     enroll: 'Nieuwe server wil zich aanmelden', reenroll: 'Server wil een nieuwe sleutel', fingerprint: 'Vingerafdruk sleutel',
@@ -1448,7 +1469,7 @@ const PAGE = `<!DOCTYPE html>
   var T = {
     en: {
       approve: 'Approve access', register: 'Register a passkey', server: 'Server', service: 'Service', user: 'User', from: 'From',
-      command: 'Command', name: 'Name', allow: 'Allow for ', once: 'Just this once', create: 'Create passkey',
+      command: 'Command', name: 'Name', allow: 'Allow for ', both: 'SSH and sudo: ', once: 'Just this once', create: 'Create passkey',
       approved: 'Approved. You can close this page.', registered: 'Passkey created. Check that the server shows the same fingerprint:',
       denied: 'This request was denied.', expired: 'This request has expired.', done: 'This request was already answered.',
       cancelled: 'Cancelled or not allowed. Try again.', unsupported: 'This browser cannot use passkeys. Open the link in Safari or Chrome.',
@@ -1457,7 +1478,7 @@ const PAGE = `<!DOCTYPE html>
     },
     nl: {
       approve: 'Toegang goedkeuren', register: 'Passkey registreren', server: 'Server', service: 'Dienst', user: 'Gebruiker', from: 'Vanaf',
-      command: 'Opdracht', name: 'Naam', allow: 'Toestaan voor ', once: 'Alleen deze keer', create: 'Passkey aanmaken',
+      command: 'Opdracht', name: 'Naam', allow: 'Toestaan voor ', both: 'SSH en sudo: ', once: 'Alleen deze keer', create: 'Passkey aanmaken',
       approved: 'Goedgekeurd. Je kunt deze pagina sluiten.', registered: 'Passkey aangemaakt. Controleer of de server dezelfde vingerafdruk toont:',
       denied: 'Dit verzoek is geweigerd.', expired: 'Dit verzoek is verlopen.', done: 'Dit verzoek is al beantwoord.',
       cancelled: 'Geannuleerd of niet toegestaan. Probeer opnieuw.', unsupported: 'Deze browser kan geen passkeys gebruiken. Open de link in Safari of Chrome.',
@@ -1581,6 +1602,9 @@ const PAGE = `<!DOCTYPE html>
     if (!window.PublicKeyCredential || !navigator.credentials) { msg(t.unsupported, 'bad'); return; }
     if (KIND === 'approve') {
       button(t.allow + duration(info.window), true, function () { approve(info, 'window'); });
+      if (info.challenges.both && info.window_sudo) {
+        button(t.both + duration(info.window) + ' + sudo ' + duration(info.window_sudo), false, function () { approve(info, 'both'); });
+      }
       button(t.once, false, function () { approve(info, 'once'); });
     } else {
       button(t.create, true, function () { register(info); });
