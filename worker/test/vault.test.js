@@ -173,22 +173,22 @@ function run(env, args, input) {
 
 // As a tool that starts each command in its own session would: a new
 // session every time, started by the same process (this test).
-function runHeld(env, args) {
+// (execFile ignores "detached", so spawn.)
+function spawnIn(cmd, args, env) {
   return new Promise((resolve) => {
-    execFile(BIN, args, { env, timeout: 120000, detached: true }, (err, stdout, stderr) => {
-      resolve({ code: err ? err.code ?? 1 : 0, stdout, stderr });
-    });
+    const p = spawn(cmd, args, { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    p.stdout.on('data', (d) => (stdout += d));
+    p.stderr.on('data', (d) => (stderr += d));
+    const timer = setTimeout(() => p.kill(), 120000);
+    p.on('close', (code) => { clearTimeout(timer); resolve({ code: code ?? 1, stdout, stderr }); });
   });
 }
+const runHeld = (env, args) => spawnIn(BIN, args, env);
 
-// From another session, started by another process.
-function runElsewhere(env, args) {
-  return new Promise((resolve) => {
-    execFile('setsid', ['--wait', BIN, ...args], { env, timeout: 120000, detached: true }, (err, stdout, stderr) => {
-      resolve({ code: err ? err.code ?? 1 : 0, stdout, stderr });
-    });
-  });
-}
+// From another session, started by another process (setsid forks, since
+// the spawned process already leads its own session).
+const runElsewhere = (env, args) => spawnIn('setsid', ['--wait', BIN, ...args], env);
 
 const vaultMessages = () => sent.filter((p) => p.reply_markup && p.reply_markup.inline_keyboard.flat().some((b) => b.url && b.url.includes('/vault/release/'))).length;
 
