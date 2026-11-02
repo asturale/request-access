@@ -199,6 +199,8 @@ func (a *Agent) handle(c *net.UnixConn) {
 				maxHold, maxLease := cfg.Vault.HoldLimits()
 				idle, total, terms = holdTerms(req.Hold, maxHold, maxLease)
 			}
+		} else {
+			a.Logf("vault: %s / %q: cannot tell the caller's session, not held (%s)", u.Username, s.Name, scopeTrace(cred.Pid))
 		}
 	}
 	a.Logf("vault: %s asks for %q (reason %q, hold %q)", u.Username, s.Name, reason, terms)

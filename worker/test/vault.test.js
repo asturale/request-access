@@ -22,6 +22,7 @@ const PASSWORD = 'correct horse battery staple 42';
 const ME = os.userInfo().username;
 
 let mf, tg, workerURL, agent;
+let agentLog = ''; // what the agent logged, shown when a hold test fails
 const messages = [];
 const sent = []; // every sendMessage, with its parameters
 // What the fake approver does with the next vault message:
@@ -268,6 +269,8 @@ test('vault add stores only ciphertext and a salted commitment', async () => {
 
 test('start the agent on web1', async () => {
   agent = spawn(BIN, ['vault', 'agent'], { env: web1, stdio: ['ignore', 'pipe', 'pipe'] });
+  agent.stdout.on('data', (d) => (agentLog += d));
+  agent.stderr.on('data', (d) => (agentLog += d));
   for (let i = 0; i < 50 && !fs.existsSync(web1.REQUEST_ACCESS_VAULT_SOCKET); i++) await new Promise((r) => setTimeout(r, 100));
   assert.ok(fs.existsSync(web1.REQUEST_ACCESS_VAULT_SOCKET), 'agent socket exists');
 });
@@ -388,7 +391,7 @@ test('hold: the approver agrees, the next use in the same session needs no appro
   await settled(s0);
   assert.equal(r.code, 0, r.stderr);
   assert.equal(r.stdout, 's3cret-value');
-  assert.match(r.stderr, /held for this session, 10m0s between uses/);
+  assert.match(r.stderr, /held for this session, 10m0s between uses/, 'agent log:\n' + agentLog.split('\n').slice(-6).join('\n'));
   assert.equal(last.info.hold, 'idle=600,max=14400', 'the cap applies, and the terms are on the page');
   assert.equal(last.held, true);
   assert.match(messages.at(-1), /Asks to hold it: 10 min between uses, max 4 h/);

@@ -168,6 +168,25 @@ func sessionScope(pid int32) string {
 	return fmt.Sprintf("%d@%d", leader.ppid, parent.start)
 }
 
+// scopeTrace says why sessionScope found no scope, for the log.
+func scopeTrace(pid int32) string {
+	out := ""
+	p := int(pid)
+	for i := 0; i < 3 && p > 0; i++ {
+		st, err := procStat(p)
+		if err != nil {
+			return out + fmt.Sprintf("%d: %v", p, err)
+		}
+		out += fmt.Sprintf("%d(%s) ppid=%d sid=%d; ", p, st.comm, st.ppid, st.session)
+		if i == 0 {
+			p = st.session
+		} else {
+			p = st.ppid
+		}
+	}
+	return out
+}
+
 type stat struct {
 	comm          string
 	ppid, session int
