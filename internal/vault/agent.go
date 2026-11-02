@@ -42,12 +42,23 @@ func envOr(k, def string) string {
 type AgentRequest struct {
 	Name   string `json:"name"`
 	Reason string `json:"reason"`
+	// Hold asks the agent to keep the secret for this many seconds between
+	// uses, for this user and session (see hold.go); the host config caps
+	// it, and the approver decides.
+	Hold int64 `json:"hold,omitempty"`
+	// Forget drops the caller's held secrets (all, or only Name).
+	Forget bool `json:"forget,omitempty"`
 }
 
 type AgentAnswer struct {
 	Secret string `json:"secret,omitempty"` // standard base64
 	Env    string `json:"env,omitempty"`
-	Error  string `json:"error,omitempty"`
+	// Held says how the secret was held: "new" (released and now held for
+	// HeldFor seconds between uses) or "reused" (served from a hold).
+	Held    string `json:"held,omitempty"`
+	HeldFor int64  `json:"held_for,omitempty"`
+	Dropped int    `json:"dropped,omitempty"` // for Forget
+	Error   string `json:"error,omitempty"`
 }
 
 const (
@@ -59,13 +70,15 @@ const (
 )
 
 // Agent serves secret requests from local users. It runs as root because it
-// signs requests with the host key and reads the secret files; it never
-// holds a usable secret except for the moment it hands one over.
+// signs requests with the host key and reads the secret files. It holds a
+// usable secret only for the moment it hands one over, or, when the caller
+// asked and the approver agreed, in memory for the hold's terms.
 type Agent struct {
 	Logf    func(string, ...any)
 	mu      sync.Mutex
 	pending map[uint32]int
 	slots   chan struct{}
+	holds   holds
 }
 
 // Serve listens on SocketPath until the listener fails.
@@ -88,6 +101,11 @@ func (a *Agent) Serve() error {
 		return err
 	}
 	a.Logf("vault agent listening on %s", SocketPath)
+	go func() {
+		for range time.Tick(30 * time.Second) {
+			a.holds.sweep(time.Now())
+		}
+	}()
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -138,6 +156,12 @@ func (a *Agent) handle(c *net.UnixConn) {
 		reply(AgentAnswer{Error: "bad request"})
 		return
 	}
+	if req.Forget {
+		n := a.holds.forget(cred.Uid, req.Name)
+		a.Logf("vault: %s dropped %d held secret(s)", u.Username, n)
+		reply(AgentAnswer{Dropped: n})
+		return
+	}
 	s, err := Load(req.Name)
 	// Unknown and forbidden look the same to the caller.
 	if err != nil || !s.Allows(u) {
@@ -146,15 +170,57 @@ func (a *Agent) handle(c *net.UnixConn) {
 		return
 	}
 	reason := clean(req.Reason, maxReason)
-	a.Logf("vault: %s asks for %q (reason %q)", u.Username, s.Name, reason)
-	value, err := Request(s, u.Username, reason, clean(commandOf(cred.Pid), maxDetail))
+	detail := clean(commandOf(cred.Pid), maxDetail)
+	var key holdKey
+	var terms string
+	var idle, total int64
+	if req.Hold > 0 {
+		if scope := sessionScope(cred.Pid); scope != "" {
+			key = holdKey{uid: cred.Uid, name: s.Name, commit: s.Commit, scope: scope}
+			if value, env, id, gen, ok := a.holds.get(key, time.Now()); ok {
+				// Every reuse is reported; if the approver revoked the hold,
+				// or the report fails, ask again instead. The hold may also
+				// have been forgotten or ended while the report was out.
+				err := Reused(id, reason, detail)
+				if err == nil && !a.holds.still(key, gen, time.Now()) {
+					err = errors.New("dropped meanwhile")
+				}
+				if err == nil {
+					a.Logf("vault: %s / %q: served from hold", u.Username, s.Name)
+					reply(AgentAnswer{Secret: base64.StdEncoding.EncodeToString(value), Env: env, Held: "reused"})
+					clear(value)
+					return
+				}
+				clear(value)
+				a.holds.drop(key)
+				a.Logf("vault: %s / %q: hold ended: %v", u.Username, s.Name, err)
+			}
+			if cfg, _, _, err := host.LoadConfig(); err == nil {
+				maxHold, maxLease := cfg.Vault.HoldLimits()
+				idle, total, terms = holdTerms(req.Hold, maxHold, maxLease)
+			}
+		} else {
+			a.Logf("vault: %s / %q: cannot tell the caller's session, not held (%s)", u.Username, s.Name, scopeTrace(cred.Pid))
+		}
+	}
+	a.Logf("vault: %s asks for %q (reason %q, hold %q)", u.Username, s.Name, reason, terms)
+	value, held, id, err := Request(s, u.Username, reason, detail, terms)
 	if err != nil {
 		a.Logf("vault: %s / %q: %v", u.Username, s.Name, err)
 		reply(AgentAnswer{Error: err.Error()})
 		return
 	}
-	a.Logf("vault: %s / %q: released", u.Username, s.Name)
-	reply(AgentAnswer{Secret: base64.StdEncoding.EncodeToString(value), Env: s.Env})
+	ans := AgentAnswer{Secret: base64.StdEncoding.EncodeToString(value), Env: s.Env}
+	if held {
+		now := time.Now()
+		a.holds.put(key, &heldSecret{
+			value: append([]byte{}, value...), env: s.Env, request: id,
+			idle: time.Duration(idle) * time.Second, until: now.Add(time.Duration(total) * time.Second), lastUsed: now,
+		})
+		ans.Held, ans.HeldFor = "new", idle
+	}
+	a.Logf("vault: %s / %q: released (held: %v)", u.Username, s.Name, held)
+	reply(ans)
 	clear(value)
 }
 
@@ -179,74 +245,126 @@ func (a *Agent) release(uid uint32) {
 // that signature against the hosts stored inside the locked vault key,
 // decrypts the secret with the vault password and seals it to a key made for
 // this request only. The result must match the secret's commitment.
-func Request(s *Secret, username, reason, detail string) ([]byte, error) {
+//
+// With hold terms (see HoldTerms), the approver may agree to let the agent
+// hold the secret; held then says whether they did. id is the Worker's
+// request id, under which reuse of a hold is reported.
+func Request(s *Secret, username, reason, detail, hold string) (value []byte, held bool, id string, err error) {
 	cfg, key, _, err := host.LoadConfig()
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 	if cfg.Vault == nil {
-		return nil, errors.New("no vault key pinned")
+		return nil, false, "", errors.New("no vault key pinned")
 	}
 	reply, err := ecdh.P256().GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 	replyKey := EncodePublicKey(reply.PublicKey())
 	nonce := proto.Nonce()
-	sig := ed25519.Sign(key, RequestMessage(cfg.Name, username, s.Name, reason, detail, replyKey, nonce, s.Box))
+	sig := ed25519.Sign(key, RequestMessage(cfg.Name, username, s.Name, reason, detail, replyKey, nonce, s.Box, hold))
 	client := cfg.Client(key)
 	var created struct {
 		ID      string `json:"id"`
 		Expires int64  `json:"expires"`
 	}
-	err = client.Do("POST", "/v1/vault/request", map[string]any{
+	body := map[string]any{
 		"name": s.Name, "user": username, "reason": reason, "detail": detail,
 		"box": s.Box, "reply_key": replyKey, "vault_key": cfg.Vault.Key,
 		"nonce": nonce, "sig": b64.EncodeToString(sig),
-	}, &created)
-	if err != nil {
-		return nil, err
+	}
+	if hold != "" {
+		body["hold"] = hold
+	}
+	if err = client.Do("POST", "/v1/vault/request", body, &created); err != nil {
+		return nil, false, "", err
 	}
 	var st struct {
 		Status string `json:"status"`
 		Sealed *Box   `json:"sealed"`
 	}
 	if err := waitFor(client, "/v1/vault/request/"+created.ID, created.Expires, &st, func() string { return st.Status }); err != nil {
-		return nil, fmt.Errorf("not released: %w", err)
+		return nil, false, "", fmt.Errorf("not released: %w", err)
 	}
-	opened, err := Open(reply, st.Sealed, ReleaseAAD(nonce, s.Name))
-	if err != nil {
-		return nil, err
+	// Sealed for a hold only if the approver agreed to the signed terms.
+	var opened []byte
+	if hold != "" {
+		if opened, err = Open(reply, st.Sealed, HeldReleaseAAD(nonce, s.Name, hold)); err == nil {
+			held = true
+		}
 	}
-	value, err := s.split(opened)
+	if !held {
+		if opened, err = Open(reply, st.Sealed, ReleaseAAD(nonce, s.Name)); err != nil {
+			return nil, false, "", err
+		}
+	}
+	v, err := s.split(opened)
 	if err != nil {
 		clear(opened)
-		return nil, err
+		return nil, false, "", err
 	}
-	out := append([]byte{}, value...)
+	out := append([]byte{}, v...)
 	clear(opened)
-	return out, nil
+	return out, held, created.ID, nil
 }
 
-// Ask is the client side: it asks the local agent for a secret.
-func Ask(name, reason string) (value []byte, env string, err error) {
-	c, err := net.Dial("unix", SocketPath)
+// Reused reports to the approver that a held secret is used again, and fails
+// if they revoked the hold.
+func Reused(id, reason, detail string) error {
+	cfg, key, _, err := host.LoadConfig()
 	if err != nil {
-		return nil, "", fmt.Errorf("vault agent not reachable (%w); is request-access-vault running?", err)
+		return err
 	}
-	defer c.Close()
-	if err := json.NewEncoder(c).Encode(AgentRequest{Name: name, Reason: reason}); err != nil {
-		return nil, "", err
+	var out struct {
+		Status string `json:"status"`
 	}
-	var ans AgentAnswer
-	if err := json.NewDecoder(io.LimitReader(c, 64<<10)).Decode(&ans); err != nil {
-		return nil, "", fmt.Errorf("no answer from the vault agent: %w", err)
+	if err := cfg.Client(key).Do("POST", "/v1/vault/held/"+id, map[string]any{
+		"reason": reason, "detail": detail, "nonce": proto.Nonce(),
+	}, &out); err != nil {
+		return err
 	}
-	if ans.Error != "" {
-		return nil, "", errors.New(ans.Error)
+	if out.Status != "held" {
+		return fmt.Errorf("hold %s", out.Status)
+	}
+	return nil
+}
+
+// Ask is the client side: it asks the local agent for a secret, to be held
+// for hold between uses if that is not zero.
+func Ask(name, reason string, hold time.Duration) (value []byte, ans AgentAnswer, err error) {
+	ans, err = ask(AgentRequest{Name: name, Reason: reason, Hold: int64(hold / time.Second)})
+	if err != nil {
+		return nil, ans, err
 	}
 	value, err = base64.StdEncoding.DecodeString(ans.Secret)
-	return value, ans.Env, err
+	ans.Secret = ""
+	return value, ans, err
+}
+
+// Forget asks the agent to drop the caller's held secrets (name "" for all).
+func Forget(name string) (int, error) {
+	ans, err := ask(AgentRequest{Name: name, Forget: true})
+	return ans.Dropped, err
+}
+
+func ask(req AgentRequest) (AgentAnswer, error) {
+	var ans AgentAnswer
+	c, err := net.Dial("unix", SocketPath)
+	if err != nil {
+		return ans, fmt.Errorf("vault agent not reachable (%w); is request-access-vault running?", err)
+	}
+	defer c.Close()
+	if err := json.NewEncoder(c).Encode(req); err != nil {
+		return ans, err
+	}
+	if err := json.NewDecoder(io.LimitReader(c, 64<<10)).Decode(&ans); err != nil {
+		return ans, fmt.Errorf("no answer from the vault agent: %w", err)
+	}
+	if ans.Error != "" {
+		return ans, errors.New(ans.Error)
+	}
+	return ans, nil
 }
 
 func peerCred(c *net.UnixConn) (*syscall.Ucred, error) {

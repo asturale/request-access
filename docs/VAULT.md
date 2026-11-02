@@ -8,6 +8,7 @@ page that opens from Telegram, and the secret goes only to that one request.
 ```sh
 request-access vault run cloudflare -r "update DNS" -- ./update-dns.sh   # gets $CF_TOKEN
 request-access vault get github -r "push release" | gh auth login --with-token
+request-access vault run github --hold 30m -- git push   # held for this session, see Holds
 ```
 
 ## How it works
@@ -49,6 +50,42 @@ request-access vault get github -r "push release" | gh auth login --with-token
   password can slip in another value) and passes the secret to the caller,
   which puts it in the command's environment.
 
+## Holds
+
+A caller can ask the agent to hold a released secret, so that the next uses
+in the same session need no new approval:
+
+```sh
+request-access vault run github --hold 30m -r "push" -- git push
+request-access vault forget [NAME]   # drop your holds now
+```
+
+- **The approver decides.** The hold terms (time between uses, and in
+  total) are part of the signed request; the page shows them with a box,
+  ticked by default. Untick it to release once. The page then seals the
+  secret for a hold or for one use, and the agent only holds it if the
+  seal says so, so the Worker cannot turn a single release into a hold.
+- **Root sets the limits** in `/etc/request-access/config.json`, under
+  `vault`: `max_hold` (seconds between uses, default 3600; 0 turns holds
+  off) and `max_lease` (seconds in total, default 14400, at most 43200).
+  `--hold` above `max_hold` is capped.
+- **Only in memory**, in the agent (root), never on disk, and gone when the
+  agent stops. A hold ends when it is not used for its idle time, at its
+  total time, when the secret file changes, or with `vault forget`.
+- **Same user, same secret, same session.** The session is the process
+  that started the caller's session: the sshd of an SSH login, or a tool
+  (such as a coding agent) that runs every command in a new session. A
+  command in another login, or started by another tool, is asked again.
+  Callers adopted by the service manager (daemons) are never held.
+- **Every reuse is reported**: the agent tells the Worker first, which sends
+  you a silent Telegram message with **Revoke**. After Revoke, or if the
+  report fails, the agent drops the secret and asks again.
+
+What a hold costs: while it lasts, any process of that user in that session
+(or anything that can act as that user, see below) can get the secret
+without you typing the password. You see it happen, and can revoke it, but
+only after the fact. Use holds for a work session, not for unattended jobs.
+
 ## Setup
 
 On each server (as root, after `enroll`):
@@ -83,7 +120,8 @@ What it protects:
   files hold only ciphertext, and the key to open them exists only on the
   page, unlocked by a password that is never sent anywhere.
 - **Use without you knowing**: every release needs your password on the
-  page, for that request; there is no cache and no time window.
+  page, for that request. The only exception is a hold you agreed to on the
+  page (see Holds), and each use under it is reported to you.
 - **The Worker** cannot read a secret, redirect a release to itself, or
   substitute a value: it only sees sealed data, the request is signed by a
   server the vault trusts, and the result must match the commitment.
@@ -118,24 +156,29 @@ What it does not protect:
 | POST | `/v1/vault/trust` | host | `{nonce}` → `{id, expires}`; link to trust this host |
 | GET | `/v1/vault/init/<id>?wait=N`, `/v1/vault/trust/<id>?wait=N` | host | `{status, key?}` |
 | GET | `/v1/vault/key` | host | `{key, fingerprint}`, for `vault pin` |
-| POST | `/v1/vault/request` | host | `{name, user, reason, detail, box, reply_key, vault_key, nonce, sig}` → `{id, expires}` |
+| POST | `/v1/vault/request` | host | `{name, user, reason, detail, box, reply_key, vault_key, nonce, sig, hold?}` → `{id, expires}` |
 | GET | `/v1/vault/request/<id>?wait=N` | host | `{status, sealed?}`; `sealed` is delivered once |
+| POST | `/v1/vault/held/<id>` | host | `{reason, detail, nonce}` → `{status: held\|revoked\|expired}`; reports a reuse (silent message with Revoke) |
 | GET | `/vault/(setup\|trust\|release)/<id>` | none | the vault page |
 | GET | `/v1/vault/page/(setup\|trust\|release)/<id>` | none | data for the page |
 | POST | `/v1/vault/page/setup/<id>` | none | `{key, locked, auth: {salt, hash}}` |
 | POST | `/v1/vault/page/trust/<id>` | none | `{locked, proof, base}`; `base` is the `iv` of the lock it was made from, refused if the lock changed meanwhile; earlier locks are kept |
-| POST | `/v1/vault/page/release/<id>` | none | `{sealed, proof}` |
+| POST | `/v1/vault/page/release/<id>` | none | `{sealed, proof, held?}`; `held` only decides whether the message offers Revoke |
 
 A box is `{v: 1, epk, iv, ct}` (base64url): `epk` is an ephemeral P-256
 public key; the AES-256-GCM key is HKDF-SHA256 over the ECDH secret with salt
 `epk || recipient public key` and info `secrets-vault v1`. Authenticated
 data: `secrets-vault secret v1\n<host>\n<name>` for a stored secret (whose
 plaintext is a 32-byte salt followed by the secret) and
-`secrets-vault release v1\n<nonce>\n<name>` for a released one.
+`secrets-vault release v1\n<nonce>\n<name>` for a released one, or
+`secrets-vault release v2\n<nonce>\n<name>\n<hold>` for one the approver
+agreed to let the host hold.
 
 The request signature (Ed25519, host key) covers length-prefixed lines
 (`<byte length>:<value>\n`) of `secrets-vault request v1`, host, user,
 name, reason, detail, reply key, nonce and base64url(SHA-256(`epk.iv.ct`)).
+A request that asks for a hold starts with `secrets-vault request v2` and
+has the hold terms, `idle=<seconds>,max=<seconds>`, as a last line.
 
 The locked vault key is `{kdf: "pbkdf2-sha256", iter, salt, iv, ct}`: AES-256-GCM
 over the JSON `{"key": <PKCS#8 private key>, "hosts": {<name>: <Ed25519 key>}}`,
