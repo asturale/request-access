@@ -144,6 +144,7 @@ function run(args, extraEnv = {}) {
 }
 
 const sudo = (user) => run(['pam'], { PAM_TYPE: 'account', PAM_SERVICE: 'sudo', PAM_USER: 'root', PAM_RUSER: user });
+const ssh = (user) => run(['pam'], { PAM_TYPE: 'account', PAM_SERVICE: 'sshd', PAM_USER: user, PAM_RHOST: '10.9.9.9' });
 const config = () => JSON.parse(fs.readFileSync(path.join(env.REQUEST_ACCESS_CONFIG_DIR, 'config.json')));
 
 test('enroll', async () => {
@@ -278,6 +279,43 @@ test('the Worker rejects a signature for the wrong challenge', async () => {
   onLink = null;
   assert.equal(res, 400);
   assert.notEqual(r.code, 0);
+});
+
+test('SSH + sudo with the passkey: one signature, both windows', async () => {
+  let res;
+  onLink = async (url) => (res = await phone.approve(url, 'both'));
+  let r = await ssh('frank');
+  onLink = null;
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.ok(res.info.challenges.both && res.info.window_sudo > 0, 'the page offers it for SSH');
+  const before = messages.length;
+  r = await sudo('frank');
+  assert.equal(r.code, 0, 'sudo came with the SSH approval');
+  assert.ok(!messages.slice(before).some((m) => m.buttons.some((b) => b.url)), 'no new approval link');
+  r = await run(['status']);
+  assert.match(r.stdout, /sudo frank \(valid for .*passkey\)/);
+});
+
+test('a passkey approval of SSH alone does not cover sudo', async () => {
+  onLink = async (url) => phone.approve(url, 'window');
+  let r = await ssh('gina');
+  assert.equal(r.code, 0, r.stdout);
+  // The Worker will not take the plain signature as "both" either.
+  let bad;
+  onLink = async (url) => {
+    const id = url.split('/').pop();
+    const info = await (await fetch(`${workerURL}/v1/approve/${id}`)).json();
+    const cd = phone.clientData('webauthn.get', info.challenges.window);
+    bad = (await fetch(`${workerURL}/v1/approve/${id}`, {
+      method: 'POST',
+      body: JSON.stringify({ choice: 'both', assertion: { id: phone.id, client_data_json: b64u(cd), authenticator_data: b64u(Buffer.alloc(37)), signature: 'AA' } }),
+    })).status;
+    await tap(`r:${id}:d`);
+  };
+  r = await sudo('gina');
+  onLink = null;
+  assert.equal(bad, 400, 'no "both" challenge for a sudo request, nor a mismatched one');
+  assert.notEqual(r.code, 0, 'sudo still needs its own approval');
 });
 
 test('the last passkey cannot be removed while required; export round-trips', async () => {
