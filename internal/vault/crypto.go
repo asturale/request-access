@@ -42,15 +42,37 @@ func ReleaseAAD(nonce, name string) []byte {
 	return []byte("secrets-vault release v1\n" + nonce + "\n" + name)
 }
 
+// HeldReleaseAAD is used instead of ReleaseAAD when the approver agreed to
+// let the agent hold the secret on the terms the host asked for (see
+// HoldTerms), so the Worker cannot turn a single release into a held one.
+func HeldReleaseAAD(nonce, name, hold string) []byte {
+	return []byte("secrets-vault release v2\n" + nonce + "\n" + name + "\n" + hold)
+}
+
+// HoldTerms is how a hold is signed and shown: seconds the agent may keep
+// the secret between uses, and at most in total.
+func HoldTerms(idle, max int64) string {
+	if idle <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("idle=%d,max=%d", idle, max)
+}
+
 // RequestMessage is what a host signs when it asks for a secret. The vault
 // page checks the signature against the host keys stored inside the locked
 // vault key, so the Worker cannot change who receives the secret, or what
 // the approver is shown. Fields are length-prefixed, so none can spill into
-// the next.
-func RequestMessage(host, user, name, reason, detail, replyKey, nonce string, box *Box) []byte {
+// the next. A request that asks for a hold (hold != "") is a v2 message
+// with the hold terms as an extra field; without one it stays v1.
+func RequestMessage(host, user, name, reason, detail, replyKey, nonce string, box *Box, hold string) []byte {
 	h := sha256.Sum256([]byte(box.EPK + "." + box.IV + "." + box.CT))
+	fields := []string{"secrets-vault request v1", host, user, name, reason, detail, replyKey, nonce, b64.EncodeToString(h[:])}
+	if hold != "" {
+		fields[0] = "secrets-vault request v2"
+		fields = append(fields, hold)
+	}
 	var out []byte
-	for _, f := range []string{"secrets-vault request v1", host, user, name, reason, detail, replyKey, nonce, b64.EncodeToString(h[:])} {
+	for _, f := range fields {
 		out = fmt.Appendf(out, "%d:%s\n", len(f), f)
 	}
 	return out

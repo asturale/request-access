@@ -40,7 +40,7 @@ WantedBy=multi-user.target
 
 func cmdVault(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: vault init|pin|add|list|remove|agent|install|run|get")
+		return errors.New("usage: vault init|pin|add|list|remove|agent|install|run|get|forget")
 	}
 	switch args[0] {
 	case "run":
@@ -48,19 +48,34 @@ func cmdVault(args []string) error {
 	case "get":
 		fs := flag.NewFlagSet("vault get", flag.ExitOnError)
 		reason := fs.String("r", "", "why you need it (shown to the approver)")
+		hold := fs.Duration("hold", 0, holdHelp)
 		name, rest := splitName(args[1:])
 		fs.Parse(rest)
 		if name == "" {
-			return errors.New("usage: vault get NAME [-r REASON]")
+			return errors.New("usage: vault get NAME [-r REASON] [--hold DURATION]")
 		}
-		value, _, err := vault.Ask(name, *reason)
+		value, ans, err := vault.Ask(name, *reason, *hold)
 		if err != nil {
 			return err
 		}
+		reportHold(ans, *hold)
 		os.Stdout.Write(value)
 		if isTerminal(os.Stdout.Fd()) {
 			fmt.Println()
 		}
+		return nil
+	case "forget":
+		name := ""
+		if len(args) > 2 {
+			return errors.New("usage: vault forget [NAME]")
+		} else if len(args) == 2 {
+			name = args[1]
+		}
+		n, err := vault.Forget(name)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Dropped %d held secret(s).\n", n)
 		return nil
 	}
 	if err := requireRoot(); err != nil {
@@ -159,20 +174,23 @@ func vaultRun(args []string) error {
 	fs := flag.NewFlagSet("vault run", flag.ExitOnError)
 	reason := fs.String("r", "", "why you need it (shown to the approver)")
 	envName := fs.String("env", "", "variable to put the secret in (default: the secret's own, else SECRET)")
+	hold := fs.Duration("hold", 0, holdHelp)
 	name, rest := splitName(args)
 	fs.Parse(rest)
 	cmd := fs.Args()
 	if name == "" || len(cmd) == 0 {
-		return errors.New("usage: vault run NAME [-r REASON] [--env VAR] -- COMMAND...")
+		return errors.New("usage: vault run NAME [-r REASON] [--env VAR] [--hold DURATION] -- COMMAND...")
 	}
 	bin, err := exec.LookPath(cmd[0])
 	if err != nil {
 		return err
 	}
-	value, env, err := vault.Ask(name, *reason)
+	value, ans, err := vault.Ask(name, *reason, *hold)
 	if err != nil {
 		return err
 	}
+	reportHold(ans, *hold)
+	env := ans.Env
 	if bytes.IndexByte(value, 0) >= 0 {
 		return errors.New("this secret contains a NUL byte and cannot go in an environment variable; use vault get")
 	}
@@ -191,6 +209,20 @@ func vaultRun(args []string) error {
 		}
 	}
 	return syscall.Exec(bin, cmd, append(environ, v+"="+string(value)))
+}
+
+const holdHelp = "ask the approver to let the agent hold the secret for this session, for this long between uses (e.g. 30m; capped by the server)"
+
+// reportHold tells the caller, on stderr, what became of a requested hold.
+func reportHold(ans vault.AgentAnswer, asked time.Duration) {
+	switch {
+	case ans.Held == "reused":
+		fmt.Fprintln(os.Stderr, "request-access: served from the hold (the approver is told)")
+	case ans.Held == "new":
+		fmt.Fprintf(os.Stderr, "request-access: held for this session, %s between uses; drop it with: vault forget\n", time.Duration(ans.HeldFor)*time.Second)
+	case asked > 0:
+		fmt.Fprintln(os.Stderr, "request-access: released once, not held")
+	}
 }
 
 func vaultInstall() error {

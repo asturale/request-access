@@ -23,6 +23,7 @@ const ME = os.userInfo().username;
 
 let mf, tg, workerURL, agent;
 const messages = [];
+const sent = []; // every sendMessage, with its parameters
 // What the fake approver does with the next vault message:
 // { password } to go ahead, 'deny', or { forge: true } to post a made-up release.
 let vaultAction = { password: PASSWORD };
@@ -85,7 +86,10 @@ async function actOnVaultMessage(params) {
       last = { id, ...(await pagePost(kind, id, { sealed: fake, proof: 'A'.repeat(43) })) };
       await deny();
     } else {
-      last = { id, info, ...(await pagePost(kind, id, await c.releaseSecret(info.vault, vaultAction.password, info))) };
+      const rel = await c.releaseSecret(info.vault, vaultAction.password, info, vaultAction.hold);
+      // claimHeld: the Worker (or a link holder) claims a hold the approver did not give.
+      if (vaultAction.claimHeld) rel.held = true;
+      last = { id, info, held: rel.held, ...(await pagePost(kind, id, rel)) };
     }
   } catch (e) {
     last = { error: e, id };
@@ -111,9 +115,11 @@ before(async () => {
       res.setHeader('Content-Type', 'application/json');
       if (method === 'sendMessage') {
         messages.push(params.text);
+        sent.push(params);
         const kb = params.reply_markup && params.reply_markup.inline_keyboard.flat();
+        const allow = kb && kb.find((b) => (b.callback_data || '').endsWith(':a'));
         if (kb && kb.some((b) => b.url && b.url.includes('/vault/'))) setTimeout(() => actOnVaultMessage(params), 200);
-        else if (kb) setTimeout(() => tap(kb.find((b) => (b.callback_data || '').endsWith(':a')).callback_data), 200);
+        else if (allow) setTimeout(() => tap(allow.callback_data), 200);
         return res.end(JSON.stringify({ ok: true, result: { message_id: messages.length } }));
       }
       res.end(JSON.stringify({ ok: true, result: true }));
@@ -163,6 +169,27 @@ function run(env, args, input) {
     if (input !== undefined) p.stdin.end(input);
   });
 }
+
+// As a tool that starts each command in its own session would: a new
+// session every time, started by the same process (this test).
+function runHeld(env, args) {
+  return new Promise((resolve) => {
+    execFile(BIN, args, { env, timeout: 120000, detached: true }, (err, stdout, stderr) => {
+      resolve({ code: err ? err.code ?? 1 : 0, stdout, stderr });
+    });
+  });
+}
+
+// From another session, started by another process.
+function runElsewhere(env, args) {
+  return new Promise((resolve) => {
+    execFile('setsid', ['--wait', BIN, ...args], { env, timeout: 120000, detached: true }, (err, stdout, stderr) => {
+      resolve({ code: err ? err.code ?? 1 : 0, stdout, stderr });
+    });
+  });
+}
+
+const vaultMessages = () => sent.filter((p) => p.reply_markup && p.reply_markup.inline_keyboard.flat().some((b) => b.url && b.url.includes('/vault/release/'))).length;
 
 const vaultFile = (env, name) => path.join(env.REQUEST_ACCESS_CONFIG_DIR, 'vault', name + '.json');
 const config = (env) => JSON.parse(fs.readFileSync(path.join(env.REQUEST_ACCESS_CONFIG_DIR, 'config.json')));
@@ -343,4 +370,109 @@ test('the page refuses what the host did not sign, and hosts the vault does not 
 
 test('unknown ids get no page', async () => {
   for (const k of ['release', 'setup', 'trust']) assert.equal((await fetch(`${workerURL}/vault/${k}/${'0'.repeat(32)}`)).status, 404);
+});
+
+// ------------------------------------------------------------------ holds
+
+let heldId = null;
+
+test('hold: the approver agrees, the next use in the same session needs no approval but is reported', async () => {
+  // Root caps the hold at 10 minutes between uses.
+  const c = config(web1);
+  c.vault.max_hold = 600;
+  fs.writeFileSync(path.join(web1.REQUEST_ACCESS_CONFIG_DIR, 'config.json'), JSON.stringify(c));
+  vaultAction = { password: PASSWORD, hold: true };
+  const asked = vaultMessages();
+  const s0 = seq;
+  let r = await runHeld(web1, ['vault', 'run', 'db', '--hold', '2h', '-r', 'push', '--', 'sh', '-c', 'printf %s "$DB_PASS"']);
+  await settled(s0);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.stdout, 's3cret-value');
+  assert.match(r.stderr, /held for this session, 10m0s between uses/);
+  assert.equal(last.info.hold, 'idle=600,max=14400', 'the cap applies, and the terms are on the page');
+  assert.equal(last.held, true);
+  assert.match(messages.at(-1), /Asks to hold it: 10 min between uses, max 4 h/);
+  heldId = last.id;
+
+  const before = sent.length;
+  r = await runHeld(web1, ['vault', 'get', 'db', '--hold', '30m', '-r', 'push again']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.stdout, 's3cret-value');
+  assert.match(r.stderr, /served from the hold/);
+  assert.equal(vaultMessages(), asked + 1, 'no second approval');
+  assert.equal(sent.length, before + 1);
+  const note = sent.at(-1);
+  assert.equal(note.disable_notification, true, 'the reuse report is silent');
+  assert.match(note.text, /held secret used again/);
+  assert.match(note.text, /push again/);
+  assert.equal(note.reply_markup.inline_keyboard.flat()[0].callback_data, `h:${heldId}:d`);
+});
+
+test('hold: only for callers that ask, and only in the same session', async () => {
+  vaultAction = { password: PASSWORD };
+  const asked = vaultMessages();
+  let r = await runHeld(web1, ['vault', 'get', 'db']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(vaultMessages(), asked + 1, 'without --hold the approver is asked');
+  r = await runElsewhere(web1, ['vault', 'get', 'db', '--hold', '30m']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(vaultMessages(), asked + 2, 'another session is asked again');
+  assert.match(r.stderr, /released once, not held/);
+  r = await runHeld(web1, ['vault', 'get', 'db', '--hold', '30m']);
+  assert.match(r.stderr, /served from the hold/, 'the first session still has its hold');
+  assert.equal(vaultMessages(), asked + 2);
+});
+
+test('hold: revoked on Telegram, the host asks again', async () => {
+  await tap(`h:${heldId}:d`);
+  vaultAction = { password: PASSWORD, hold: true };
+  const asked = vaultMessages();
+  const s0 = seq;
+  const r = await runHeld(web1, ['vault', 'get', 'db', '--hold', '30m']);
+  await settled(s0);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(vaultMessages(), asked + 1);
+  assert.match(r.stderr, /held for this session/);
+  // The Worker answers "revoked" to the old hold from now on.
+  const again = await runHeld(web1, ['vault', 'get', 'db', '--hold', '30m']);
+  assert.match(again.stderr, /served from the hold/, 'the new hold works');
+});
+
+test('hold: vault forget drops it', async () => {
+  let r = await runHeld(web1, ['vault', 'forget']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /Dropped 1 held secret/);
+  vaultAction = { password: PASSWORD, hold: false };
+  const asked = vaultMessages();
+  const s0 = seq;
+  r = await runHeld(web1, ['vault', 'get', 'db', '--hold', '30m']);
+  await settled(s0);
+  assert.equal(vaultMessages(), asked + 1);
+  assert.match(r.stderr, /released once, not held/, 'the approver unticked the hold');
+});
+
+test('hold: the Worker cannot grant a hold the approver did not give', async () => {
+  vaultAction = { password: PASSWORD, hold: false, claimHeld: true };
+  let s0 = seq;
+  let r = await runHeld(web1, ['vault', 'get', 'db', '--hold', '30m']);
+  await settled(s0);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /released once, not held/, 'the seal decides, not the post');
+  vaultAction = { password: PASSWORD };
+  const asked = vaultMessages();
+  s0 = seq;
+  r = await runHeld(web1, ['vault', 'get', 'db', '--hold', '30m']);
+  await settled(s0);
+  assert.equal(vaultMessages(), asked + 1, 'nothing was held');
+});
+
+test('hold: a request with forged hold terms is refused by the page', async () => {
+  const c = await pageCrypto(`${workerURL}/vault/release/${releasedId}`);
+  // Hold terms the host did not sign: the signature check fails.
+  await assert.rejects(c.releaseSecret(releasedInfo.vault, PASSWORD, { ...releasedInfo, hold: 'idle=43200,max=43200' }, true), (e) => e.badSignature);
+});
+
+test('hold: the Worker refuses bad terms and reports for unknown holds', async () => {
+  const r = await fetch(`${workerURL}/v1/vault/held/${'0'.repeat(32)}`, { method: 'POST', body: '{}' });
+  assert.notEqual(r.status, 200, 'hosts only');
 });

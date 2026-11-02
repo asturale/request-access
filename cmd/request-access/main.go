@@ -59,8 +59,10 @@ Server (as root):
   pam                                    (called by pam_exec)
 
 Any user:
-  vault     run NAME [-r REASON] [--env VAR] -- COMMAND...   run COMMAND with the secret in $VAR
-  vault     get NAME [-r REASON]         print the secret (after approval)
+  vault     run NAME [-r REASON] [--env VAR] [--hold D] -- COMMAND...   run COMMAND with the secret in $VAR
+  vault     get NAME [-r REASON] [--hold D]   print the secret (after approval)
+                                         --hold 30m: ask to keep it for this session (see docs/VAULT.md)
+  vault     forget [NAME]                drop your held secrets
 
   version
 `

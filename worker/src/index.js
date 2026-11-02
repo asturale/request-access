@@ -102,6 +102,7 @@ export class State {
     if (m === 'GET' && p === '/v1/vault/key') return this.vaultKey(caller);
     if (m === 'POST' && p === '/v1/vault/request') return this.vaultRequest(caller, body, url);
     if (m === 'GET' && (mm = p.match(/^\/v1\/vault\/request\/([0-9a-f]{32})$/))) return this.vaultRequestStatus(caller, mm[1], url);
+    if (m === 'POST' && (mm = p.match(/^\/v1\/vault\/held\/([0-9a-f]{32})$/))) return this.vaultHeld(caller, mm[1], body);
     if (m === 'GET' && p === '/v1/admin/state') return this.adminState(caller);
     if (m === 'POST' && p === '/v1/admin/actions') return this.createAdminAction(caller, body);
     if (m === 'GET' && (mm = p.match(/^\/v1\/admin\/actions\/([0-9a-f]{32})$/))) return this.adminActionStatus(caller, mm[1], url);
@@ -526,13 +527,14 @@ export class State {
     const box = boxOf(r.box);
     if (!isB64u(r.reply_key, 87, 87)) throw new HttpError(400, 'bad reply key');
     if (!isB64u(r.sig, 86, 86)) throw new HttpError(400, 'bad signature');
+    const hold = r.hold === undefined ? '' : holdOf(r.hold);
     const open = (await this.list('vreq:')).filter((v) => v.host === caller.name && v.status === 'pending');
     if (open.length >= MAX_PENDING_VAULT) throw new HttpError(429, 'too many open vault requests');
     const t = texts((await this.config()).lang);
     const id = randomHex(16);
     const req = {
       id, host: caller.name, user, name, reason, detail, box,
-      reply_key: r.reply_key, nonce: r.nonce, sig: r.sig,
+      reply_key: r.reply_key, nonce: r.nonce, sig: r.sig, hold,
       status: 'pending', created: now(), expires: now() + VAULT_TIMEOUT,
     };
     const lines = [
@@ -541,6 +543,7 @@ export class State {
     ];
     if (reason) lines.push(`${esc(t.reason)}: ${esc(reason)}`);
     if (detail) lines.push(`<code>${esc(detail)}</code>`);
+    if (hold) lines.push(`⏳ ${esc(t.hold_ask)}: ${esc(holdText(hold, t))}`);
     const sent = await this.telegram('sendMessage', {
       chat_id: this.env.TELEGRAM_CHAT_ID,
       text: lines.join('\n'),
@@ -582,6 +585,39 @@ export class State {
     }
   }
 
+  // A host reports that it served a held secret again: the approver gets a
+  // silent message with Revoke. Once revoked (or past its terms) the host is
+  // told, drops the secret and asks again.
+  async vaultHeld(caller, id, body) {
+    if (caller.kind !== 'host') throw new HttpError(403, 'hosts only');
+    const r = parseJson(body);
+    await this.useNonce(caller.name, r.nonce);
+    const req = await this.storage.get('vreq:' + id);
+    if (!req || req.host !== caller.name || !req.held) throw new HttpError(404, 'not found');
+    if (req.revoked) return json({ status: 'revoked' });
+    const terms = parseHold(req.hold);
+    if (!terms || now() >= req.decided + terms.max) return json({ status: 'expired' });
+    const t = texts((await this.config()).lang);
+    const reason = str(r.reason, 600) || '';
+    const detail = str(r.detail, 800) || '';
+    const lines = [
+      `🗝️ <code>${esc(req.name)}</code> ${esc(t.on)} <b>${esc(req.host)}</b>: ${esc(t.vault_reused)}`,
+      `${esc(t.user)}: <code>${esc(req.user)}</code>`,
+    ];
+    if (reason) lines.push(`${esc(t.reason)}: ${esc(reason)}`);
+    if (detail) lines.push(`<code>${esc(detail)}</code>`);
+    await this.telegram('sendMessage', {
+      chat_id: this.env.TELEGRAM_CHAT_ID,
+      text: lines.join('\n'),
+      parse_mode: 'HTML',
+      disable_notification: true,
+      reply_markup: revokeButton(id, t),
+    });
+    req.reuses = (req.reuses || 0) + 1;
+    await this.storage.put('vreq:' + id, req);
+    return json({ status: 'held' });
+  }
+
   // Data for the vault page.
   async vaultInfo(kind, id) {
     const lang = (await this.config()).lang;
@@ -604,7 +640,7 @@ export class State {
       lang,
       status,
       host: req.host, user: req.user, name: req.name, reason: req.reason, detail: req.detail, expires: req.expires,
-      box: req.box, reply_key: req.reply_key, nonce: req.nonce, sig: req.sig,
+      hold: req.hold || '', box: req.box, reply_key: req.reply_key, nonce: req.nonce, sig: req.sig,
       // The locked key only while the request is open.
       vault: status === 'pending' ? vaultOut : { fingerprint: vault.fp },
     });
@@ -625,8 +661,13 @@ export class State {
       req.sealed = boxOf(r.sealed);
       req.status = 'approved';
       req.decided = now();
+      // What the page says it chose; the host only holds the secret if the
+      // page sealed it for a hold, which needs the vault password. This
+      // only decides whether the message offers Revoke.
+      req.held = !!(req.hold && r.held === true);
       await this.storage.put('vreq:' + id, req);
-      await this.editMsg(req, `✅ ${t.vault_released}`);
+      if (req.held) await this.editMsg(req, `✅ ${t.vault_released}, ${t.hold} ${holdText(req.hold, t)}`, revokeButton(id, t));
+      else await this.editMsg(req, `✅ ${t.vault_released}`);
       return json({ status: req.status });
     }
     const set = await this.storage.get('vset:' + id);
@@ -847,7 +888,7 @@ export class State {
       await this.telegram('answerCallbackQuery', { callback_query_id: cq.id, text: t.not_allowed });
       return json({ ok: true });
     };
-    const m = /^([rexpvs]):([0-9a-f]{32}):([aod])$/.exec(cq.data || '');
+    const m = /^([rexpvsh]):([0-9a-f]{32}):([aod])$/.exec(cq.data || '');
     let result = 'unknown';
     if (m) {
       const [, kind, id, choice] = m;
@@ -878,6 +919,17 @@ export class State {
           await this.editMsg(v, `❌ ${t.denied_by} ${who(cq.from)}`);
         }
         result = v ? v.status : 'unknown';
+      } else if (kind === 'h') {
+        // Revoke a hold: the host drops the secret at its next use.
+        const v = await this.storage.get('vreq:' + id);
+        if (v && v.held && choice === 'd') {
+          if (!v.revoked) {
+            v.revoked = now();
+            await this.storage.put('vreq:' + id, v);
+            await this.editMsg(v, `🚫 ${t.hold_revoked_by} ${who(cq.from)}`);
+          }
+          result = 'revoked';
+        }
       } else if (kind === 'e') {
         const enr = await this.storage.get('enr:' + id);
         if (enr) result = await this.decideEnroll(enr, choice === 'o' ? 'a' : choice, cq.from);
@@ -906,14 +958,16 @@ export class State {
     return data.result;
   }
 
-  async editMsg(obj, line) {
+  async editMsg(obj, line, markup) {
     if (!obj.message_id) return;
-    await this.telegram('editMessageText', {
+    const params = {
       chat_id: this.env.TELEGRAM_CHAT_ID,
       message_id: obj.message_id,
       text: `${obj.text}\n\n${esc(line)}`,
       parse_mode: 'HTML',
-    });
+    };
+    if (markup) params.reply_markup = markup;
+    await this.telegram('editMessageText', params);
   }
 
   // ---------------------------------------------------------------- housekeeping
@@ -1158,6 +1212,30 @@ function diffConfig(a, b) {
   return lines.length ? lines.join('\n') : '(no changes)';
 }
 
+// Hold terms as the host signs them (HoldTerms in internal/vault/crypto.go):
+// seconds between uses, and in total. At most 12 hours, because the record
+// that lets the approver revoke a hold is dropped a day after the request.
+function parseHold(h) {
+  const m = /^idle=([1-9][0-9]{0,4}),max=([1-9][0-9]{0,4})$/.exec(typeof h === 'string' ? h : '');
+  if (!m) return null;
+  const idle = Number(m[1]), max = Number(m[2]);
+  return idle <= max && max <= 43200 ? { idle, max } : null;
+}
+
+function holdOf(h) {
+  if (!parseHold(h)) throw new HttpError(400, 'bad hold');
+  return h;
+}
+
+function holdText(h, t) {
+  const p = parseHold(h);
+  return p ? `${fmtDuration(p.idle, t.lang)} ${t.hold_idle}, max ${fmtDuration(p.max, t.lang)}` : '';
+}
+
+function revokeButton(id, t) {
+  return { inline_keyboard: [[{ text: `🚫 ${t.hold_revoke}`, callback_data: `h:${id}:d` }]] };
+}
+
 function fmtDuration(s, lang) {
   const nl = lang === 'nl';
   if (s % 86400 === 0) return `${s / 86400} ${nl ? (s === 86400 ? 'dag' : 'dagen') : s === 86400 ? 'day' : 'days'}`;
@@ -1182,7 +1260,9 @@ function texts(lang) {
     vault_setup_title: 'Create the secrets vault', vault_setup_button: 'Create vault', vault_created: 'Vault created; compare the fingerprint with the server:',
     vault_trust_title: 'Trust a server for the vault', vault_trust_button: 'Trust server', vault_trusted: 'Server trusted',
     vault_title: 'Secret', reason: 'Reason', vault_release: 'Open to release', vault_released: 'Released',
-    status: { approved: 'Approved', denied: 'Denied', expired: 'Already expired', pending: 'Noted, waiting for more approvals', unknown: 'Unknown request', passkey_required: 'This server needs your passkey: use the 🔑 button' },
+    lang: 'en', hold_ask: 'Asks to hold it', hold: 'held', hold_idle: 'between uses', hold_revoke: 'Revoke hold', hold_revoked_by: 'Hold revoked by',
+    vault_reused: 'held secret used again',
+    status: { revoked: 'Hold revoked', approved: 'Approved', denied: 'Denied', expired: 'Already expired', pending: 'Noted, waiting for more approvals', unknown: 'Unknown request', passkey_required: 'This server needs your passkey: use the 🔑 button' },
   };
   if (lang !== 'nl') return en;
   return {
@@ -1200,7 +1280,9 @@ function texts(lang) {
     vault_setup_title: 'Kluis voor geheimen aanmaken', vault_setup_button: 'Kluis aanmaken', vault_created: 'Kluis aangemaakt; vergelijk de vingerafdruk met de server:',
     vault_trust_title: 'Server toevoegen aan de kluis', vault_trust_button: 'Server vertrouwen', vault_trusted: 'Server vertrouwd',
     vault_title: 'Geheim', reason: 'Reden', vault_release: 'Openen om vrij te geven', vault_released: 'Vrijgegeven',
-    status: { approved: 'Goedgekeurd', denied: 'Geweigerd', expired: 'Al verlopen', pending: 'Genoteerd, wacht op meer akkoorden', unknown: 'Onbekend verzoek', passkey_required: 'Deze server vraagt je passkey: gebruik de 🔑-knop' },
+    lang: 'nl', hold_ask: 'Vraagt om vast te houden', hold: 'vastgehouden', hold_idle: 'tussen gebruik', hold_revoke: 'Intrekken', hold_revoked_by: 'Ingetrokken door',
+    vault_reused: 'vastgehouden geheim opnieuw gebruikt',
+    status: { revoked: 'Ingetrokken', approved: 'Goedgekeurd', denied: 'Geweigerd', expired: 'Al verlopen', pending: 'Genoteerd, wacht op meer akkoorden', unknown: 'Onbekend verzoek', passkey_required: 'Deze server vraagt je passkey: gebruik de 🔑-knop' },
   };
 }
 
@@ -1463,6 +1545,9 @@ const VAULT_PAGE = `<!DOCTYPE html>
   label { display: block; margin: 0 0 .3rem; color: var(--muted); font-size: .9rem; }
   input { display: block; width: 100%; padding: .75rem .85rem; margin: 0 0 .8rem; font: inherit; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
   input.user { display: none; }
+  #holdbox { display: none; margin: 0 0 1rem; }
+  label.check { display: flex; gap: .6rem; align-items: flex-start; color: var(--fg); font-size: .95rem; }
+  label.check input { display: inline-block; width: auto; margin: .2rem 0 0; flex: none; }
   button { display: block; width: 100%; padding: .85rem 1rem; margin: 0 0 .6rem; font: inherit; font-weight: 600; border-radius: 10px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
   #msg { min-height: 1.5rem; margin: .5rem 0 0; }
@@ -1479,6 +1564,7 @@ const VAULT_PAGE = `<!DOCTYPE html>
     <label for="pw" id="pwlabel">Vault password</label>
     <input id="pw" type="password" name="password" autocomplete="current-password" required>
     <div id="pw2box"><label for="pw2" id="pw2label">Repeat</label><input id="pw2" type="password" name="password2" autocomplete="new-password"></div>
+    <div id="holdbox"><label class="check"><input id="hold" type="checkbox"> <span id="holdlabel"></span></label></div>
     <button id="go" type="submit">OK</button>
   </form>
   <p id="msg" role="status"></p>
@@ -1580,6 +1666,8 @@ async function trustHost(vault, password, host, hostKey) {
 async function requestMessage(info) {
   var h = b64u(await crypto.subtle.digest('SHA-256', enc.encode(info.box.epk + '.' + info.box.iv + '.' + info.box.ct)));
   var fields = ['secrets-vault request v1', info.host, info.user, info.name, info.reason || '', info.detail || '', info.reply_key, info.nonce, h];
+  // A request that asks for a hold is v2, with the hold terms last.
+  if (info.hold) { fields[0] = 'secrets-vault request v2'; fields.push(info.hold); }
   var out = new Uint8Array(0);
   for (var i = 0; i < fields.length; i++) {
     var f = enc.encode(fields[i]);
@@ -1587,7 +1675,9 @@ async function requestMessage(info) {
   }
   return out;
 }
-async function releaseSecret(vault, password, info) {
+// hold: the approver agrees to let the host hold the secret on the signed
+// terms (info.hold). The seal then says so, and the Worker cannot change it.
+async function releaseSecret(vault, password, info, hold) {
   var content = await unlock(vault, password);
   var hostKey = content.hosts[info.host];
   if (!hostKey) { var e1 = new Error('this server is not trusted by the vault'); e1.untrusted = true; throw e1; }
@@ -1599,9 +1689,12 @@ async function releaseSecret(vault, password, info) {
   var priv = await crypto.subtle.importKey('pkcs8', pkcs8, P256, false, ['deriveBits']);
   pkcs8.fill(0);
   var secret = await openBox(priv, unb64u(vault.key), info.box, enc.encode('secrets-vault secret v1' + NL + info.host + NL + info.name));
-  var sealed = await seal(unb64u(info.reply_key), secret, enc.encode('secrets-vault release v1' + NL + info.nonce + NL + info.name));
+  var held = !!(hold && info.hold);
+  var aad = held ? 'secrets-vault release v2' + NL + info.nonce + NL + info.name + NL + info.hold
+    : 'secrets-vault release v1' + NL + info.nonce + NL + info.name;
+  var sealed = await seal(unb64u(info.reply_key), secret, enc.encode(aad));
   secret.fill(0);
-  return { sealed: sealed, proof: b64u(await passwordProof(password, unb64u(vault.auth_salt))) };
+  return { sealed: sealed, held: held, proof: b64u(await passwordProof(password, unb64u(vault.auth_salt))) };
 }
 // CRYPTO-END
 (function () {
@@ -1621,7 +1714,9 @@ async function releaseSecret(vault, password, info) {
       short: 'Use at least 16 characters; let your password manager generate one.', busy: 'Working...', failed: 'Failed: ',
       hint_setup: 'Save this password in your password manager. Without it, the secrets cannot be recovered. Check that the server key matches what the server printed.',
       hint_trust: 'Only continue if you just ran "vault pin" on this server, and the server key matches what it printed.',
-      hint_release: 'Only release what you started yourself just now. The secret goes only to this request.'
+      hint_release: 'Only release what you started yourself just now. The secret goes only to this request.',
+      hold: 'Hold', hold_label: 'Let the server hold it for this session: no new approval while it is used at least every {idle}, for at most {max}. Every reuse is reported to you, with Revoke.',
+      approved_held: 'Released and held. Each reuse is reported on Telegram. You can close this page.'
     },
     nl: {
       setup: 'Kluis voor geheimen aanmaken', trust: 'Server toevoegen aan de kluis', release: 'Geheim vrijgeven',
@@ -1636,7 +1731,9 @@ async function releaseSecret(vault, password, info) {
       short: 'Gebruik minstens 16 tekens; laat je wachtwoordmanager er een maken.', busy: 'Bezig...', failed: 'Mislukt: ',
       hint_setup: 'Bewaar dit wachtwoord in je wachtwoordmanager. Zonder dit wachtwoord zijn de geheimen niet terug te halen. Controleer of de serversleutel klopt met wat de server toonde.',
       hint_trust: 'Ga alleen verder als je net zelf "vault pin" op deze server draaide en de serversleutel klopt met wat de server toonde.',
-      hint_release: 'Geef alleen vrij wat je zelf net hebt gestart. Het geheim gaat alleen naar dit verzoek.'
+      hint_release: 'Geef alleen vrij wat je zelf net hebt gestart. Het geheim gaat alleen naar dit verzoek.',
+      hold: 'Vasthouden', hold_label: 'Laat de server het vasthouden voor deze sessie: geen nieuwe goedkeuring zolang het minstens elke {idle} wordt gebruikt, hooguit {max}. Elk hergebruik meldt zich bij jou, met Intrekken.',
+      approved_held: 'Vrijgegeven en vastgehouden. Elk hergebruik krijg je op Telegram. Je kunt deze pagina sluiten.'
     }
   };
   var t = T.en;
@@ -1648,7 +1745,16 @@ async function releaseSecret(vault, password, info) {
     dt.textContent = k; dd.textContent = v;
     $('facts').append(dt, dd);
   }
-  function closed(status) { $('form').style.display = 'none'; msg(t[status] || t.done, status === 'approved' ? 'ok' : 'bad'); }
+  function closed(status) { $('form').style.display = 'none'; msg(t[status] || t.done, status === 'approved' || status === 'approved_held' ? 'ok' : 'bad'); }
+  function dur(s, nl) {
+    if (s % 3600 === 0) return (s / 3600) + (nl ? ' uur' : ' h');
+    if (s % 60 === 0) return (s / 60) + ' min';
+    return s + ' s';
+  }
+  function holdTerms(h) {
+    var m = /^idle=([1-9][0-9]{0,4}),max=([1-9][0-9]{0,4})$/.exec(h || '');
+    return m ? { idle: Number(m[1]), max: Number(m[2]) } : null;
+  }
   async function post(body) {
     var res = await fetch('/v1/vault/page/' + KIND + '/' + id, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     var data = await res.json().catch(function () { return {}; });
@@ -1674,8 +1780,9 @@ async function releaseSecret(vault, password, info) {
         var r1 = await post(await trustHost(info.vault, pw, info.host, info.host_key));
         if (r1.status === 'approved') { $('form').style.display = 'none'; msg(t.trusted, 'ok'); } else closed(r1.status);
       } else {
-        var rel = await releaseSecret(info.vault, pw, info);
-        closed((await post(rel)).status);
+        var rel = await releaseSecret(info.vault, pw, info, $('hold').checked);
+        var st = (await post(rel)).status;
+        closed(st === 'approved' && rel.held ? 'approved_held' : st);
       }
     } catch (e) {
       $('go').disabled = false;
@@ -1696,6 +1803,14 @@ async function releaseSecret(vault, password, info) {
     if (KIND === 'release') {
       fact(t.secret, info.name); fact(t.user, info.user); fact(t.reason, info.reason); fact(t.command, info.detail);
       fact(t.vault, info.vault.fingerprint);
+      var terms = holdTerms(info.hold);
+      if (terms) {
+        var nl = info.lang === 'nl';
+        fact(t.hold, dur(terms.idle, nl) + ' / max ' + dur(terms.max, nl));
+        $('holdlabel').textContent = t.hold_label.replace('{idle}', dur(terms.idle, nl)).replace('{max}', dur(terms.max, nl));
+        $('hold').checked = true;
+        $('holdbox').style.display = 'block';
+      }
     } else {
       fact(t.server_key, info.host_fp);
       if (info.vault) fact(t.vault, info.vault.fingerprint);

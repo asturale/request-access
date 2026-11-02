@@ -204,6 +204,7 @@ them until you release one, for one request, with your vault password:
 request-access vault init                                   # once: create the vault
 request-access vault add cloudflare --users alice --env CF_TOKEN   # secret on stdin
 request-access vault run cloudflare -r "update DNS" -- ./update-dns.sh
+request-access vault run github --hold 30m -- git push   # approver may let the agent hold it a while
 ```
 
 See [docs/VAULT.md](docs/VAULT.md), including what it does not protect.

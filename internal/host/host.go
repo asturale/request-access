@@ -56,6 +56,34 @@ type Config struct {
 // VaultConfig is the pinned vault key.
 type VaultConfig struct {
 	Key string `json:"key"` // P-256 public key, raw, base64url
+	// How long the agent may hold a released secret for the session that
+	// asked (vault run/get --hold), in seconds: MaxHold between uses
+	// (default 3600; 0 turns holding off), MaxLease in total (default 14400,
+	// at most 43200).
+	MaxHold  *int64 `json:"max_hold,omitempty"`
+	MaxLease *int64 `json:"max_lease,omitempty"`
+}
+
+// HoldLimits returns the configured limits for holding released secrets.
+func (v *VaultConfig) HoldLimits() (maxHold, maxLease int64) {
+	maxHold, maxLease = 3600, 14400
+	if v == nil {
+		return 0, 0
+	}
+	if v.MaxHold != nil {
+		maxHold = *v.MaxHold
+	}
+	if v.MaxLease != nil {
+		maxLease = *v.MaxLease
+	}
+	if maxHold < 0 {
+		maxHold = 0
+	}
+	// The Worker forgets a request a day after it was made, and with it
+	// the record that lets the approver revoke a hold; stay well inside.
+	maxLease = min(max(maxLease, 0), 43200)
+	maxHold = min(maxHold, maxLease)
+	return maxHold, maxLease
 }
 
 // PasskeyConfig pins the approvers' passkeys on this host.
