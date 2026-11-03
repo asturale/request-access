@@ -86,6 +86,32 @@ What a hold costs: while it lasts, any process of that user in that session
 without you typing the password. You see it happen, and can revoke it, but
 only after the fact. Use holds for a work session, not for unattended jobs.
 
+## Remember on this device
+
+On the release page, **Remember the vault on this device for 12 h** (ticked
+by default) keeps the opened vault in the browser, so the next releases need
+your passkey (Face ID, fingerprint, PIN) instead of the vault password.
+
+- **What is kept**, in IndexedDB for the Worker's origin: the vault's
+  private key as a non-extractable `CryptoKey` (a script on the page can use
+  it there but cannot copy it out), the list of trusted servers and the
+  password proof. Nothing is sent anywhere. It expires 12 hours after it was
+  saved; **Forget this device** removes it at once.
+- **The passkey check is local**: the page asks for a passkey of this site
+  with user verification before it releases. The Worker and the servers do
+  not see it; it keeps someone holding your unlocked phone from releasing a
+  secret with one tap.
+- **When the vault changes** (a server trusted or re-pinned later, a new
+  vault), the page forgets what it kept and asks for the password again.
+
+What it costs: for those 12 hours, the browser profile holds what the
+password unlocks. Whoever can run code in it as this site, or read its
+storage from the device, can release secrets without the password. That
+includes a replaced Worker script (see the threat model): without this
+option it only gets the vault key when you type the password; with it, any
+page of the Worker can use the key silently until it expires. Use it only
+on your own device.
+
 ## Setup
 
 On each server (as root, after `enroll`):
@@ -120,8 +146,10 @@ What it protects:
   files hold only ciphertext, and the key to open them exists only on the
   page, unlocked by a password that is never sent anywhere.
 - **Use without you knowing**: every release needs your password on the
-  page, for that request. The only exception is a hold you agreed to on the
-  page (see Holds), and each use under it is reported to you.
+  page, for that request. The exceptions are a hold you agreed to on the
+  page (see Holds), where each use under it is reported to you, and a
+  device you let remember the vault, where each release needs your passkey
+  (see Remember on this device).
 - **The Worker** cannot read a secret, redirect a release to itself, or
   substitute a value: it only sees sealed data, the request is signed by a
   server the vault trusts, and the result must match the commitment.

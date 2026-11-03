@@ -1651,6 +1651,9 @@ const VAULT_PAGE = `<!DOCTYPE html>
   label.check input { display: inline-block; width: auto; margin: .2rem 0 0; flex: none; }
   button { display: block; width: 100%; padding: .85rem 1rem; margin: 0 0 .6rem; font: inherit; font-weight: 600; border-radius: 10px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
+  button.secondary { display: none; background: transparent; color: var(--accent); }
+  #rememberbox { display: none; margin: 0 0 1rem; }
+  #pwbox.off { display: none; }
   #msg { min-height: 1.5rem; margin: .5rem 0 0; }
   .ok { color: var(--ok); } .bad { color: var(--bad); } .muted { color: var(--muted); font-size: .9rem; }
   code.fp { display: block; margin-top: .4rem; font-size: .85rem; overflow-wrap: anywhere; color: var(--fg); }
@@ -1662,11 +1665,13 @@ const VAULT_PAGE = `<!DOCTYPE html>
   <dl id="facts"></dl>
   <form id="form" autocomplete="on">
     <input class="user" type="text" name="username" autocomplete="username" value="secrets-vault" readonly>
-    <label for="pw" id="pwlabel">Vault password</label>
-    <input id="pw" type="password" name="password" autocomplete="current-password" required>
+    <div id="pwbox"><label for="pw" id="pwlabel">Vault password</label>
+    <input id="pw" type="password" name="password" autocomplete="current-password" required></div>
     <div id="pw2box"><label for="pw2" id="pw2label">Repeat</label><input id="pw2" type="password" name="password2" autocomplete="new-password"></div>
     <div id="holdbox"><label class="check"><input id="hold" type="checkbox"> <span id="holdlabel"></span></label></div>
+    <div id="rememberbox"><label class="check"><input id="remember" type="checkbox"> <span id="rememberlabel"></span></label></div>
     <button id="go" type="submit">OK</button>
+    <button id="forget" class="secondary" type="button"></button>
   </form>
   <p id="msg" role="status"></p>
   <p class="muted" id="hint"></p>
@@ -1776,26 +1781,34 @@ async function requestMessage(info) {
   }
   return out;
 }
+// The opened vault: the private key (not extractable, so the page can keep
+// it on this device), the trusted hosts and the proof of the password.
+async function unlockKeys(vault, password) {
+  var content = await unlock(vault, password);
+  var pkcs8 = unb64u(content.key);
+  var priv = await crypto.subtle.importKey('pkcs8', pkcs8, P256, false, ['deriveBits']);
+  pkcs8.fill(0);
+  return { priv: priv, hosts: content.hosts, proof: b64u(await passwordProof(password, unb64u(vault.auth_salt))) };
+}
 // hold: the approver agrees to let the host hold the secret on the signed
 // terms (info.hold). The seal then says so, and the Worker cannot change it.
-async function releaseSecret(vault, password, info, hold) {
-  var content = await unlock(vault, password);
-  var hostKey = content.hosts[info.host];
+async function releaseWith(vault, keys, info, hold) {
+  var hostKey = keys.hosts[info.host];
   if (!hostKey) { var e1 = new Error('this server is not trusted by the vault'); e1.untrusted = true; throw e1; }
   var pk = await crypto.subtle.importKey('raw', unb64u(hostKey), { name: 'Ed25519' }, false, ['verify']);
   if (!(await crypto.subtle.verify({ name: 'Ed25519' }, pk, unb64u(info.sig), await requestMessage(info)))) {
     var e2 = new Error('the request is not signed by this server'); e2.badSignature = true; throw e2;
   }
-  var pkcs8 = unb64u(content.key);
-  var priv = await crypto.subtle.importKey('pkcs8', pkcs8, P256, false, ['deriveBits']);
-  pkcs8.fill(0);
-  var secret = await openBox(priv, unb64u(vault.key), info.box, enc.encode('secrets-vault secret v1' + NL + info.host + NL + info.name));
+  var secret = await openBox(keys.priv, unb64u(vault.key), info.box, enc.encode('secrets-vault secret v1' + NL + info.host + NL + info.name));
   var held = !!(hold && info.hold);
   var aad = held ? 'secrets-vault release v2' + NL + info.nonce + NL + info.name + NL + info.hold
     : 'secrets-vault release v1' + NL + info.nonce + NL + info.name;
   var sealed = await seal(unb64u(info.reply_key), secret, enc.encode(aad));
   secret.fill(0);
-  return { sealed: sealed, held: held, proof: b64u(await passwordProof(password, unb64u(vault.auth_salt))) };
+  return { sealed: sealed, held: held, proof: keys.proof };
+}
+async function releaseSecret(vault, password, info, hold) {
+  return releaseWith(vault, await unlockKeys(vault, password), info, hold);
 }
 // CRYPTO-END
 (function () {
@@ -1817,7 +1830,13 @@ async function releaseSecret(vault, password, info, hold) {
       hint_trust: 'Only continue if you just ran "vault pin" on this server, and the server key matches what it printed.',
       hint_release: 'Only release what you started yourself just now. The secret goes only to this request.',
       hold: 'Hold', hold_label: 'Let the server hold it for this session: no new approval while it is used at least every {idle}, for at most {max}. Every reuse is reported to you, with Revoke.',
-      approved_held: 'Released and held. Each reuse is reported on Telegram. You can close this page.'
+      approved_held: 'Released and held. Each reuse is reported on Telegram. You can close this page.',
+      remember: 'Remember the vault on this device for 12 h: confirm with your passkey instead of the password.',
+      remembered: 'Unlocked on this device until {until}. Confirm with your passkey.',
+      release_passkey: 'Release with passkey', forget: 'Forget this device',
+      forgotten: 'Forgotten on this device. Enter the vault password.',
+      stale: 'The vault changed since this device remembered it. Enter the vault password.',
+      nopasskey: 'Passkey check failed or cancelled.'
     },
     nl: {
       setup: 'Kluis voor geheimen aanmaken', trust: 'Server toevoegen aan de kluis', release: 'Geheim vrijgeven',
@@ -1834,7 +1853,13 @@ async function releaseSecret(vault, password, info, hold) {
       hint_trust: 'Ga alleen verder als je net zelf "vault pin" op deze server draaide en de serversleutel klopt met wat de server toonde.',
       hint_release: 'Geef alleen vrij wat je zelf net hebt gestart. Het geheim gaat alleen naar dit verzoek.',
       hold: 'Vasthouden', hold_label: 'Laat de server het vasthouden voor deze sessie: geen nieuwe goedkeuring zolang het minstens elke {idle} wordt gebruikt, hooguit {max}. Elk hergebruik meldt zich bij jou, met Intrekken.',
-      approved_held: 'Vrijgegeven en vastgehouden. Elk hergebruik krijg je op Telegram. Je kunt deze pagina sluiten.'
+      approved_held: 'Vrijgegeven en vastgehouden. Elk hergebruik krijg je op Telegram. Je kunt deze pagina sluiten.',
+      remember: 'Onthoud de kluis 12 uur op dit apparaat: daarna bevestig je met je passkey in plaats van het wachtwoord.',
+      remembered: 'Op dit apparaat ontgrendeld tot {until}. Bevestig met je passkey.',
+      release_passkey: 'Vrijgeven met passkey', forget: 'Vergeet dit apparaat',
+      forgotten: 'Vergeten op dit apparaat. Vul het kluiswachtwoord in.',
+      stale: 'De kluis is veranderd sinds dit apparaat hem onthield. Vul het kluiswachtwoord in.',
+      nopasskey: 'Passkey-controle mislukt of afgebroken.'
     }
   };
   var t = T.en;
@@ -1863,6 +1888,56 @@ async function releaseSecret(vault, password, info, hold) {
     return data;
   }
   function problem(text) { var e = new Error(text); e.shown = true; return e; }
+  // Remember on this device: the opened vault in IndexedDB, keyed by the
+  // vault's public key. The private key is a non-extractable CryptoKey, so
+  // even a script on this page can only use it here, not copy it out.
+  var REMEMBER_MS = 12 * 3600 * 1000;
+  var saved = null; // the remembered vault in use on this page, if any
+  function idb(mode, fn) {
+    return new Promise(function (ok, fail) {
+      var o = indexedDB.open('secrets-vault', 1);
+      o.onupgradeneeded = function () { o.result.createObjectStore('device'); };
+      o.onerror = function () { fail(o.error); };
+      o.onsuccess = function () {
+        var tx = o.result.transaction('device', mode), r = fn(tx.objectStore('device'));
+        tx.oncomplete = function () { o.result.close(); ok(r && r.result); };
+        tx.onerror = tx.onabort = function () { o.result.close(); fail(tx.error); };
+      };
+    });
+  }
+  // lock: the iv of the locked vault it came from; any change to the vault
+  // (a server trusted or re-pinned since) means: ask for the password again.
+  async function recall(vault) {
+    var e = await idb('readonly', function (st) { return st.get(vault.key); }).catch(function () { return null; });
+    if (e && e.until > Date.now() && e.lock === vault.locked.iv && e.priv && e.hosts && e.proof) return e;
+    if (e) { await forget(vault.key); if (e.until > Date.now()) return 'stale'; }
+    return null;
+  }
+  function remember(vault, keys) {
+    return idb('readwrite', function (st) { st.put({ priv: keys.priv, hosts: keys.hosts, proof: keys.proof, lock: vault.locked.iv, until: Date.now() + REMEMBER_MS }, vault.key); });
+  }
+  function forget(key) { return idb('readwrite', function (st) { st.delete(key); }).catch(function () {}); }
+  // shortcut: checked on this page only (the Worker and host do not see it);
+  // it keeps someone holding the unlocked phone from releasing with one tap.
+  async function passkeyCheck() {
+    try {
+      await navigator.credentials.get({ publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(32)), rpId: location.hostname,
+        userVerification: 'required', timeout: 120000 } });
+    } catch (e) { throw problem(t.nopasskey); }
+  }
+  // Back to the password, with a reason.
+  async function usePassword(info, why) {
+    saved = null;
+    await forget(info.vault.key);
+    $('pwbox').className = ''; $('pw').required = true;
+    $('forget').style.display = 'none';
+    $('rememberbox').style.display = 'block';
+    $('go').disabled = false;
+    $('go').textContent = t.release_btn;
+    msg(why, 'bad');
+    $('pw').focus();
+  }
   async function submit(info) {
     var pw = $('pw').value;
     $('go').disabled = true; msg(t.busy);
@@ -1880,9 +1955,25 @@ async function releaseSecret(vault, password, info, hold) {
       } else if (KIND === 'trust') {
         var r1 = await post(await trustHost(info.vault, pw, info.host, info.host_key));
         if (r1.status === 'approved') { $('form').style.display = 'none'; msg(t.trusted, 'ok'); } else closed(r1.status);
+      } else if (saved) {
+        await passkeyCheck();
+        var relS;
+        try { relS = await releaseWith(info.vault, saved, info, $('hold').checked); } catch (e) {
+          // A server trusted after this device remembered the vault.
+          if (e && (e.untrusted || e.badSignature)) return await usePassword(info, t.stale);
+          throw e;
+        }
+        var stS;
+        try { stS = (await post(relS)).status; } catch (e) {
+          if (/wrong vault password/.test(e.message)) return await usePassword(info, t.stale);
+          throw e;
+        }
+        closed(stS === 'approved' && relS.held ? 'approved_held' : stS);
       } else {
-        var rel = await releaseSecret(info.vault, pw, info, $('hold').checked);
+        var keys = await unlockKeys(info.vault, pw);
+        var rel = await releaseWith(info.vault, keys, info, $('hold').checked);
         var st = (await post(rel)).status;
+        if (st === 'approved' && $('remember').checked) await remember(info.vault, keys).catch(function () {});
         closed(st === 'approved' && rel.held ? 'approved_held' : st);
       }
     } catch (e) {
@@ -1929,6 +2020,22 @@ async function releaseSecret(vault, password, info, hold) {
     if (info.status !== 'pending') return closed(info.status);
     $('form').style.display = 'block';
     $('form').addEventListener('submit', function (ev) { ev.preventDefault(); submit(info); });
+    if (KIND === 'release' && window.indexedDB && window.PublicKeyCredential) {
+      $('rememberlabel').textContent = t.remember;
+      $('remember').checked = true;
+      $('forget').textContent = t.forget;
+      $('forget').addEventListener('click', function () { usePassword(info, '').then(function () { msg(t.forgotten); }); });
+      saved = await recall(info.vault);
+      if (saved === 'stale') { saved = null; msg(t.stale, 'bad'); }
+      if (saved) {
+        $('pwbox').className = 'off'; $('pw').required = false;
+        $('go').textContent = t.release_passkey;
+        $('forget').style.display = 'block';
+        msg(t.remembered.replace('{until}', new Date(saved.until).toLocaleString(info.lang === 'nl' ? 'nl-NL' : 'en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit' })));
+        return;
+      }
+      $('rememberbox').style.display = 'block';
+    }
     $('pw').focus();
   }
   main().catch(function (e) { msg(t.failed + ((e && e.message) || e), 'bad'); });
