@@ -1905,14 +1905,16 @@ async function releaseSecret(vault, password, info, hold) {
       };
     });
   }
-  async function recall(key) {
-    var e = await idb('readonly', function (st) { return st.get(key); }).catch(function () { return null; });
-    if (e && e.until > Date.now() && e.priv && e.hosts && e.proof) return e;
-    if (e) await forget(key);
+  // lock: the iv of the locked vault it came from; any change to the vault
+  // (a server trusted or re-pinned since) means: ask for the password again.
+  async function recall(vault) {
+    var e = await idb('readonly', function (st) { return st.get(vault.key); }).catch(function () { return null; });
+    if (e && e.until > Date.now() && e.lock === vault.locked.iv && e.priv && e.hosts && e.proof) return e;
+    if (e) { await forget(vault.key); if (e.until > Date.now()) return 'stale'; }
     return null;
   }
-  function remember(key, keys) {
-    return idb('readwrite', function (st) { st.put({ priv: keys.priv, hosts: keys.hosts, proof: keys.proof, until: Date.now() + REMEMBER_MS }, key); });
+  function remember(vault, keys) {
+    return idb('readwrite', function (st) { st.put({ priv: keys.priv, hosts: keys.hosts, proof: keys.proof, lock: vault.locked.iv, until: Date.now() + REMEMBER_MS }, vault.key); });
   }
   function forget(key) { return idb('readwrite', function (st) { st.delete(key); }).catch(function () {}); }
   // shortcut: checked on this page only (the Worker and host do not see it);
@@ -1958,7 +1960,7 @@ async function releaseSecret(vault, password, info, hold) {
         var relS;
         try { relS = await releaseWith(info.vault, saved, info, $('hold').checked); } catch (e) {
           // A server trusted after this device remembered the vault.
-          if (e && e.untrusted) return await usePassword(info, t.stale);
+          if (e && (e.untrusted || e.badSignature)) return await usePassword(info, t.stale);
           throw e;
         }
         var stS;
@@ -1971,7 +1973,7 @@ async function releaseSecret(vault, password, info, hold) {
         var keys = await unlockKeys(info.vault, pw);
         var rel = await releaseWith(info.vault, keys, info, $('hold').checked);
         var st = (await post(rel)).status;
-        if (st === 'approved' && $('remember').checked) await remember(info.vault.key, keys).catch(function () {});
+        if (st === 'approved' && $('remember').checked) await remember(info.vault, keys).catch(function () {});
         closed(st === 'approved' && rel.held ? 'approved_held' : st);
       }
     } catch (e) {
@@ -2023,7 +2025,8 @@ async function releaseSecret(vault, password, info, hold) {
       $('remember').checked = true;
       $('forget').textContent = t.forget;
       $('forget').addEventListener('click', function () { usePassword(info, '').then(function () { msg(t.forgotten); }); });
-      saved = await recall(info.vault.key);
+      saved = await recall(info.vault);
+      if (saved === 'stale') { saved = null; msg(t.stale, 'bad'); }
       if (saved) {
         $('pwbox').className = 'off'; $('pw').required = false;
         $('go').textContent = t.release_passkey;

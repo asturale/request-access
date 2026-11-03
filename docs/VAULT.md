@@ -101,13 +101,16 @@ your passkey (Face ID, fingerprint, PIN) instead of the vault password.
   with user verification before it releases. The Worker and the servers do
   not see it; it keeps someone holding your unlocked phone from releasing a
   secret with one tap.
-- **When the vault changes** (a server trusted later, a new vault), the page
-  forgets what it kept and asks for the password again.
+- **When the vault changes** (a server trusted or re-pinned later, a new
+  vault), the page forgets what it kept and asks for the password again.
 
 What it costs: for those 12 hours, the browser profile holds what the
 password unlocks. Whoever can run code in it as this site, or read its
-storage from the device, can release secrets without the password. Use it
-only on your own device.
+storage from the device, can release secrets without the password. That
+includes a replaced Worker script (see the threat model): without this
+option it only gets the vault key when you type the password; with it, any
+page of the Worker can use the key silently until it expires. Use it only
+on your own device.
 
 ## Setup
 
