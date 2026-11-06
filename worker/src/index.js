@@ -1521,6 +1521,8 @@ const PAGE = `<!DOCTYPE html>
   function closed(status) {
     $('actions').textContent = '';
     msg(t[status] || t.done, status === 'approved' ? 'ok' : 'bad');
+    // Browsers may refuse to close a tab they did not open by script; the message then stays.
+    if (status === 'approved') setTimeout(function () { window.close(); }, 1500);
   }
   function failed(e) {
     busy(false);
@@ -1871,7 +1873,12 @@ async function releaseSecret(vault, password, info, hold) {
     dt.textContent = k; dd.textContent = v;
     $('facts').append(dt, dd);
   }
-  function closed(status) { $('form').style.display = 'none'; msg(t[status] || t.done, status === 'approved' || status === 'approved_held' ? 'ok' : 'bad'); }
+  function closed(status) {
+    var ok = status === 'approved' || status === 'approved_held';
+    $('form').style.display = 'none'; msg(t[status] || t.done, ok ? 'ok' : 'bad');
+    // Browsers may refuse to close a tab they did not open by script; the message then stays.
+    if (ok) setTimeout(function () { window.close(); }, 1500);
+  }
   function dur(s, nl) {
     if (s % 3600 === 0) return (s / 3600) + (nl ? ' uur' : ' h');
     if (s % 60 === 0) return (s / 60) + ' min';
